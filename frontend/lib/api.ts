@@ -1,4 +1,4 @@
-import { authHeaders } from "./auth";
+import { authHeaders, clearSession } from "./auth";
 import type { ConceptEdge, ConceptNode, GraphExport } from "./graph";
 
 export const API_BASE =
@@ -36,6 +36,12 @@ async function describeFailure(res: Response): Promise<string> {
   return `${res.status} ${res.statusText || "request failed"}`;
 }
 
+function handleUnauthorized(res: Response): void {
+  if (res.status !== 401 || typeof window === "undefined") return;
+  clearSession();
+  if (!window.location.pathname.startsWith("/login")) window.location.assign("/login");
+}
+
 function failure(err: unknown, timeoutMs: number): ApiError {
   if (err instanceof ApiError) return err;
   const aborted = err instanceof DOMException && err.name === "AbortError";
@@ -63,7 +69,10 @@ async function apiFetch<T>(
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, { ...options, signal: controller.signal });
-    if (!res.ok) throw new ApiError(res.status, await describeFailure(res));
+    if (!res.ok) {
+      handleUnauthorized(res);
+      throw new ApiError(res.status, await describeFailure(res));
+    }
     return (await res.json()) as T;
   } catch (err) {
     throw failure(err, timeoutMs);
@@ -82,7 +91,10 @@ async function apiSend(
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, { ...options, signal: controller.signal });
-    if (!res.ok) throw new ApiError(res.status, await describeFailure(res));
+    if (!res.ok) {
+      handleUnauthorized(res);
+      throw new ApiError(res.status, await describeFailure(res));
+    }
   } catch (err) {
     throw failure(err, timeoutMs);
   } finally {
@@ -236,9 +248,10 @@ export async function addYouTube(url: string): Promise<void> {
 }
 
 export async function listWorkspaces(): Promise<{ id: string; name: string; role: string }[]> {
-  return apiFetch(
+  const response = await apiFetch<{ workspaces: { id: string; name: string; role: string }[] }>(
     `${API_BASE}/workspaces`,
     { headers: authHeaders() });
+  return response.workspaces;
 }
 
 export async function createWorkspace(name: string): Promise<{ id: string; name: string }> {
@@ -249,8 +262,8 @@ export async function createWorkspace(name: string): Promise<{ id: string; name:
   });
 }
 
-export async function renameWorkspace(id: string, name: string): Promise<void> {
-  await apiSend(`${API_BASE}/workspaces/${id}`, {
+export async function renameWorkspace(id: string, name: string): Promise<{ id: string; name: string; role: string }> {
+  return apiFetch(`${API_BASE}/workspaces/${id}`, {
     method: "PATCH",
     headers: authHeaders(true),
     body: JSON.stringify({ name }),
@@ -264,9 +277,10 @@ export async function deleteWorkspace(id: string): Promise<void> {
 export async function listMembers(
   workspaceId: string
 ): Promise<{ id: string; email: string; display_name: string; role: string }[]> {
-  return apiFetch(
+  const response = await apiFetch<{ members: { id: string; email: string; display_name: string; role: string }[] }>(
     `${API_BASE}/workspaces/${workspaceId}/members`,
     { headers: authHeaders() });
+  return response.members;
 }
 
 export async function addMember(workspaceId: string, email: string): Promise<void> {
@@ -274,6 +288,43 @@ export async function addMember(workspaceId: string, email: string): Promise<voi
     method: "POST",
     headers: authHeaders(true),
     body: JSON.stringify({ email }),
+  });
+}
+
+export async function removeMember(workspaceId: string, memberId: string): Promise<void> {
+  await apiSend(`${API_BASE}/workspaces/${workspaceId}/members/${encodeURIComponent(memberId)}`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+}
+
+export async function leaveWorkspace(workspaceId: string): Promise<void> {
+  await apiSend(`${API_BASE}/workspaces/${workspaceId}/leave`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+}
+
+export type NotificationItem = {
+  id: string;
+  kind: string;
+  status: string;
+  payload: Record<string, string>;
+  created_at: string;
+};
+
+export async function listNotifications(): Promise<NotificationItem[]> {
+  const response = await apiFetch<{ notifications: NotificationItem[] }>(`${API_BASE}/notifications`, {
+    headers: authHeaders(),
+  });
+  return response.notifications;
+}
+
+export async function respondToNotification(id: string, action: "accept" | "decline"): Promise<void> {
+  await apiSend(`${API_BASE}/notifications/${encodeURIComponent(id)}/respond`, {
+    method: "POST",
+    headers: authHeaders(true),
+    body: JSON.stringify({ action }),
   });
 }
 
@@ -372,7 +423,7 @@ export async function getLearningPath(conceptId: string): Promise<any> {
 
 export async function explainConcept(
   conceptId: string,
-  mode: "simple" | "step_by_step" | "source_example" | "compare",
+  mode: "simple" = "simple",
   sessionId?: string
 ): Promise<AskResponse> {
   return apiFetch(
@@ -394,13 +445,22 @@ export async function getQuiz(conceptId: string, type = "multiple_choice"): Prom
   );
 }
 
-export async function submitQuiz(conceptId: string, questionType: string, answer: string): Promise<any> {
+export async function submitQuiz(conceptId: string, questionType: string, question: any, answer: string): Promise<any> {
   return apiFetch(
     `${API_BASE}/quiz/attempts`,
     {
       method: "POST",
       headers: authHeaders(true),
-      body: JSON.stringify({ concept_id: conceptId, question_type: questionType, answer }),
+      body: JSON.stringify({
+        concept_id: conceptId,
+        question_type: questionType,
+        question_id: question.id,
+        question: question.question,
+        expected_answer: question.expected_answer || "",
+        correct_option_id: question.correct_option_id || "",
+        options: question.options || [],
+        answer,
+      }),
     },
     TIMEOUT_GENERATE,
   );

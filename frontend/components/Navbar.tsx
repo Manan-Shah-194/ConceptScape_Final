@@ -8,6 +8,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Network, Sparkles, Bell, ChevronDown, LogOut, LogIn, User, Pencil } from "lucide-react";
 import { clearSession, getToken, getUserProfile, type UserProfile } from "@/lib/auth";
 import { EditProfileModal } from "@/components/EditProfileModal";
+import { listNotifications, respondToNotification, type NotificationItem } from "@/lib/api";
 
 export function Navbar({ rightSlot }: { rightSlot?: React.ReactNode }) {
   const pathname = usePathname();
@@ -15,11 +16,14 @@ export function Navbar({ rightSlot }: { rightSlot?: React.ReactNode }) {
   const [signedIn, setSignedIn] = useState(false);
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [showEditProfile, setShowEditProfile] = useState(false);
+  const [showNotifications, setShowNotifications] = useState(false);
+  const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [profile, setProfile] = useState<UserProfile>(getUserProfile());
 
   useEffect(() => {
     setSignedIn(Boolean(getToken()));
     setProfile(getUserProfile());
+    if (getToken()) listNotifications().then(setNotifications).catch(() => setNotifications([]));
 
     const handleProfileUpdate = (e: Event) => {
       const detail = (e as CustomEvent<UserProfile>).detail;
@@ -86,7 +90,9 @@ export function Navbar({ rightSlot }: { rightSlot?: React.ReactNode }) {
         {rightSlot}
 
         {/* Notifications Bell */}
+        <div style={{ position: "relative" }}>
         <button
+          onClick={() => setShowNotifications((value) => !value)}
           className="bell-hover interactive-btn"
           style={{
             background: "transparent",
@@ -102,7 +108,22 @@ export function Navbar({ rightSlot }: { rightSlot?: React.ReactNode }) {
           title="Notifications"
         >
           <Bell size={17} />
+          {notifications.some((item) => item.status === "unread") && <span style={{ position: "absolute", top: 2, right: 2, width: 7, height: 7, borderRadius: "50%", background: "#C74747" }} />}
         </button>
+        {showNotifications && <div style={{ position: "absolute", right: 0, top: 42, width: 340, maxHeight: 420, overflowY: "auto", background: "#FFFFFF", border: "1px solid #EAE4DE", borderRadius: 12, boxShadow: "0 10px 30px rgba(0,0,0,.15)", padding: 10, zIndex: 50 }}>
+          {notifications.length === 0 ? <div style={{ padding: 14, color: "#77716D" }}>No notifications</div> : notifications.map((item) => {
+            const invite = item.kind === "workspace_invite";
+            const result = item.kind === "workspace_invite_result";
+            return <div key={item.id} style={{ padding: 12, borderBottom: "1px solid #F3ECE6" }}>
+              <div style={{ fontSize: 14, color: "#2D1E15", marginBottom: 8 }}>
+                {invite && `${item.payload.inviter_name || "A user"} wants to add you to ${item.payload.workspace_name || "a workspace"}.`}
+                {result && `${item.payload.user_name || "A user"} ${item.payload.decision === "accept" ? "accepted and joined" : "declined"} ${item.payload.workspace_name || "your workspace"}.`}
+              </div>
+              {invite && item.status === "unread" && <div style={{ display: "flex", gap: 8 }}><button onClick={async () => { await respondToNotification(item.id, "accept"); setNotifications((prev) => prev.map((n) => n.id === item.id ? { ...n, status: "accepted" } : n)); }} style={{ background: "#4A3024", color: "white", border: 0, borderRadius: 6, padding: "6px 10px" }}>Accept</button><button onClick={async () => { await respondToNotification(item.id, "decline"); setNotifications((prev) => prev.map((n) => n.id === item.id ? { ...n, status: "declined" } : n)); }} style={{ background: "#FFFFFF", color: "#4A3024", border: "1px solid #D8C8BD", borderRadius: 6, padding: "6px 10px" }}>Decline</button></div>}
+            </div>;
+          })}
+        </div>}
+        </div>
 
         {/* User Account / Log In Option */}
         {signedIn ? (

@@ -50,7 +50,18 @@ import {
 import { Navbar } from "@/components/Navbar";
 import { Footer } from "@/components/Footer";
 import { getToken, getUserProfile, getWorkspaceId, initialsOf, setWorkspaceId } from "@/lib/auth";
-import { getGraph, listDocuments, listMembers, listWorkspaces } from "@/lib/api";
+import {
+  createWorkspace,
+  deleteWorkspace,
+  getGraph,
+  listDocuments,
+  listMembers,
+  listWorkspaces,
+  addMember,
+  renameWorkspace,
+  removeMember,
+  leaveWorkspace,
+} from "@/lib/api";
 
 export type WorkspaceItem = {
   id: string;
@@ -419,69 +430,94 @@ export default function WorkspaceSettingsPage() {
     );
   };
 
-  const handleSaveDetails = () => {
-    setWorkspaces((prev) =>
-      prev.map((w) =>
-        w.id === selectedId
-          ? {
-            ...w,
-            name: editName.trim() || w.name,
-            description: editDescription.trim() || w.description,
-            category: editCategory,
-            lastModified: "Just now",
-          }
-          : w
-      )
-    );
-    setIsEditingDetails(false);
+  const handleSaveDetails = async () => {
+    const name = editName.trim();
+    if (!selectedId || !name) return;
+    try {
+      const updated = await renameWorkspace(selectedId, name);
+      setWorkspaces((prev) => prev.map((w) => w.id === selectedId
+        ? { ...w, name: updated.name, description: editDescription.trim() || w.description, category: editCategory, lastModified: "Just now" }
+        : w));
+      setIsEditingDetails(false);
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : "Could not rename workspace.");
+    }
   };
 
-  const handleCreateWorkspace = () => {
-    if (!newName.trim()) return;
-    const newWs: WorkspaceItem = {
-      id: `ws-${Date.now()}`,
-      name: newName.trim(),
-      category: newCategory,
-      description: newDescription.trim() || "Collaborative knowledge workspace.",
-      icon: newIcon,
-      color: newColor,
-      bgLight: newBgLight,
-      docs: 0,
-      concepts: 0,
-      members: 1,
-      activeTime: "Active just now",
-      createdDate: "Today",
-      lastModified: "Just now",
-      isStarred: false,
-      createdBy: (() => {
-        const me = getUserProfile();
-        return {
-          name: me.fullName,
-          email: me.email,
-          avatar: initialsOf(me.fullName, me.email),
-        };
-      })(),
-    };
-    setWorkspaces((prev) => [newWs, ...prev]);
-    setSelectedId(newWs.id);
-    setNewName("");
-    setNewDescription("");
-    setShowNewModal(false);
+  const handleCreateWorkspace = async () => {
+    const name = newName.trim();
+    if (!name) return;
+    try {
+      const created = await createWorkspace(name);
+      setNewName("");
+      setNewDescription("");
+      setShowNewModal(false);
+      setSelectedId(created.id);
+      setWorkspaceId(created.id);
+      const serverWorkspaces = await listWorkspaces();
+      const me = getUserProfile();
+      const owner = { name: me.fullName, email: me.email };
+      setWorkspaces(serverWorkspaces.map((ws) => toWorkspaceItem(ws, {
+        docs: 0,
+        concepts: 0,
+        members: 1,
+      }, owner)));
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : "Could not create workspace.");
+    }
   };
 
-  const handleDeleteWorkspace = (id: string) => {
+  const handleDeleteWorkspace = async (id: string) => {
     if (workspaces.length <= 1) {
       alert("You must keep at least one active workspace.");
       return;
     }
     if (confirm("Are you sure you want to delete this workspace and its documents?")) {
-      const nextList = workspaces.filter((w) => w.id !== id);
-      setWorkspaces(nextList);
-      if (selectedId === id) {
-        setSelectedId(nextList[0].id);
+      try {
+        await deleteWorkspace(id);
+        const nextList = workspaces.filter((w) => w.id !== id);
+        setWorkspaces(nextList);
+        if (selectedId === id && nextList[0]) {
+          setSelectedId(nextList[0].id);
+          setWorkspaceId(nextList[0].id);
+        }
+      } catch (err) {
+        setLoadError(err instanceof Error ? err.message : "Could not delete workspace.");
       }
     }
   };
+
+  const handleRemoveMember = async (memberId: string) => {
+    if (!selectedId || !confirm("Remove this member from the workspace?")) return;
+    try {
+      await removeMember(selectedId, memberId);
+      setMembersList((prev) => prev.filter((item) => item.id !== memberId));
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : "Could not remove member.");
+    }
+  };
+
+  const handleLeaveWorkspace = async () => {
+    if (!selectedId || !confirm("Leave this workspace?")) return;
+    try {
+      await leaveWorkspace(selectedId);
+      const remaining = workspaces.filter((workspace) => workspace.id !== selectedId);
+      setWorkspaces(remaining);
+      if (remaining[0]) {
+        setSelectedId(remaining[0].id);
+        setWorkspaceId(remaining[0].id);
+      } else {
+        setSelectedId("");
+        window.localStorage.removeItem("conceptscape.workspace_id");
+      }
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : "Could not leave workspace.");
+    }
+  };
+
+  const currentUserEmail = getUserProfile().email.trim().toLowerCase();
+  const currentMember = membersList.find((member) => member.email.trim().toLowerCase() === currentUserEmail);
+  const isWorkspaceOwner = currentMember?.role.trim().toLowerCase() === "owner";
 
   const renderIcon = (iconName: WorkspaceItem["icon"], size = 22, color = "#171514") => {
     switch (iconName) {
@@ -2131,6 +2167,14 @@ export default function WorkspaceSettingsPage() {
                       Collaborate and manage access permissions for this workspace.
                     </p>
                   </div>
+                  {currentMember && !isWorkspaceOwner && (
+                    <button
+                      onClick={handleLeaveWorkspace}
+                      style={{ padding: "8px 14px", borderRadius: 9999, border: "1px solid #C74747", background: "#FFF5F5", color: "#991B1B", fontWeight: 600, cursor: "pointer" }}
+                    >
+                      Leave workspace
+                    </button>
+                  )}
                 </div>
 
                 {/* Invite Box */}
@@ -2182,19 +2226,23 @@ export default function WorkspaceSettingsPage() {
                     <option value="Viewer">Viewer</option>
                   </select>
                   <button
-                    onClick={() => {
-                      if (!inviteEmail.trim()) return;
-                      setMembersList((prev) => [
-                        ...prev,
-                        {
-                          id: `usr_${Date.now()}`,
-                          name: inviteEmail.split("@")[0],
-                          email: inviteEmail.trim(),
-                          role: inviteRole,
-                          avatar: inviteEmail[0].toUpperCase(),
-                        },
-                      ]);
-                      setInviteEmail("");
+                    onClick={async () => {
+                      const email = inviteEmail.trim();
+                      if (!email || !selectedId) return;
+                      try {
+                        await addMember(selectedId, email);
+                        setInviteEmail("");
+                        const rows = await listMembers(selectedId);
+                        setMembersList(rows.map((m) => ({
+                          id: m.id,
+                          name: m.display_name || m.email || "Member",
+                          email: m.email,
+                          role: m.role,
+                          avatar: initialsOf(m.display_name || "", m.email),
+                        })));
+                      } catch (err) {
+                        setLoadError(err instanceof Error ? err.message : "Could not add workspace member.");
+                      }
                     }}
                     style={{
                       height: 38,
@@ -2266,11 +2314,9 @@ export default function WorkspaceSettingsPage() {
                         >
                           {m.role}
                         </span>
-                        {m.role !== "Owner" && (
+                        {isWorkspaceOwner && m.role.trim().toLowerCase() !== "owner" && (
                           <button
-                            onClick={() =>
-                              setMembersList((prev) => prev.filter((item) => item.id !== m.id))
-                            }
+                            onClick={() => handleRemoveMember(m.id)}
                             style={{
                               background: "transparent",
                               border: "none",

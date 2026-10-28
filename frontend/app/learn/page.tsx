@@ -36,6 +36,7 @@ import {
   getGraph,
   getLearningPath,
   getQuiz,
+  getProgress,
   submitQuiz,
   updateConceptProgress,
   type AskResponse,
@@ -62,14 +63,15 @@ export default function LearnPage() {
   const router = useRouter();
   // Populated from the graph; nothing is shown until the server answers.
   const [concepts, setConcepts] = useState<ConceptNode[]>([]);
-  const [selectedId, setSelectedId] = useState("adam_optimizer");
+  const [selectedId, setSelectedId] = useState("");
   const [path, setPath] = useState<any>(null);
   const [activeTab, setActiveTab] = useState<"explain" | "flashcard" | "quiz">("explain");
 
   // Explanation state
-  const [explainMode, setExplainMode] = useState<"simple" | "step_by_step" | "source_example" | "compare">("simple");
+  const [explainMode] = useState<"simple">("simple");
   const [explanation, setExplanation] = useState<AskResponse | null>(null);
   const [explainBusy, setExplainBusy] = useState(false);
+  const [showSources, setShowSources] = useState(false);
 
   // Flashcard state
   const [isFlipped, setIsFlipped] = useState(false);
@@ -80,6 +82,7 @@ export default function LearnPage() {
   const [quizQuestionIdx, setQuizQuestionIdx] = useState(0);
   const [quizFinished, setQuizFinished] = useState(false);
   const [quiz, setQuiz] = useState<any>(null);
+  const [quizQuestions, setQuizQuestions] = useState<any[]>([]);
   const [answer, setAnswer] = useState("");
   const [feedback, setFeedback] = useState<any>(null);
   const [quizBusy, setQuizBusy] = useState(false);
@@ -99,11 +102,7 @@ export default function LearnPage() {
   >([]);
 
   // Status & error
-  const [conceptStatus, setConceptStatus] = useState<Record<string, "learned" | "review" | "dont_know" | "revisit">>({
-    loss_function: "learned",
-    gradient_vector: "learned",
-    adam_optimizer: "review",
-  });
+  const [conceptStatus, setConceptStatus] = useState<Record<string, "learned" | "review" | "dont_know" | "revisit">>({});
   const [deckFilter, setDeckFilter] = useState<"all" | "dont_know" | "review" | "learned">("all");
   const [error, setError] = useState("");
 
@@ -116,17 +115,27 @@ export default function LearnPage() {
       .then((data) => {
         if (data.nodes && data.nodes.length > 0) {
           setConcepts(data.nodes);
-          // Prefer keeping adam_optimizer if present, else first node
-          const target = data.nodes.find((n) => n.canonical_name.toLowerCase().includes("adam")) || data.nodes[0];
+          // Always start from the first concept in the active workspace graph.
+          // Never inject a demo concept such as Adam Optimizer.
+          const target = data.nodes[0];
           setSelectedId(target.concept_id);
-          loadPath(target.concept_id);
-          loadExplanation(target.concept_id, "simple");
-          loadQuiz(target.concept_id, "multiple_choice");
+          // Do not start RAG generation or quiz requests on page load. The
+          // learner must explicitly select a concept/mode first.
         }
       })
       .catch(() => {
-        // Fallback to default demo concept state
-        loadExplanation("adam_optimizer", "simple");
+        setError("Could not load the knowledge graph. Run the pipeline and try again.");
+      });
+    getProgress()
+      .then((data) => {
+        const saved: Record<string, "learned" | "review" | "dont_know" | "revisit"> = {};
+        for (const item of data.concepts || []) {
+          saved[item.concept_id] = item.status === "revisit" ? "review" : item.status;
+        }
+        setConceptStatus(saved);
+      })
+      .catch(() => {
+        // Progress is optional until the first status is recorded.
       });
   }, [router]);
 
@@ -134,6 +143,20 @@ export default function LearnPage() {
     () => concepts.find((c) => c.concept_id === selectedId) || concepts[0] || null,
     [concepts, selectedId]
   );
+
+  const roadmapNodes = useMemo(() => {
+    const candidates = [
+      ...(path?.learn_before || []).map((item: any) => item.concept),
+      activeConcept,
+      ...(path?.learn_next || []).map((item: any) => item.concept),
+    ].filter(Boolean) as ConceptNode[];
+    const seen = new Set<string>();
+    return candidates.filter((node) => {
+      if (seen.has(node.concept_id)) return false;
+      seen.add(node.concept_id);
+      return true;
+    });
+  }, [path, activeConcept]);
 
   const deckStats = useMemo(() => {
     let dontKnow = 0;
@@ -179,28 +202,28 @@ export default function LearnPage() {
     }
   }
 
-  async function loadExplanation(id: string, mode: "simple" | "step_by_step" | "source_example" | "compare") {
+  async function loadExplanation(id: string, mode: "simple" = "simple") {
+    if (!id) return;
     setExplainBusy(true);
-    setExplainMode(mode);
+    setExplanation(null);
+    setShowSources(false);
+    setError("");
     try {
       const res = await explainConcept(id, mode);
-      if (res && res.answer) {
+      if (res) {
         setExplanation(res);
       }
       await updateConceptProgress(id, "started", 0.4);
-    } catch {
-      // In demo mode or if backend call fails, retain realistic explanation
-      if (id === "adam_optimizer" || !explanation) {
-        setExplanation(null);
-      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not generate this explanation for the selected concept.");
     } finally {
       setExplainBusy(false);
     }
   }
 
   const currentQuizList = useMemo(() => {
-    return [] as QuizQuestionItem[];
-  }, [quizType]);
+    return quizQuestions as QuizQuestionItem[];
+  }, [quizQuestions]);
 
   const pct = score.total > 0 ? Math.round((score.correct / score.total) * 100) : 0;
 
@@ -327,25 +350,23 @@ export default function LearnPage() {
     setFeedback(null);
     setQuizQuestionIdx(questionIdx);
 
-    const matchingList: QuizQuestionItem[] = [];
-    const targetQ = matchingList.find((q) => q.concept_id === id) || matchingList[questionIdx] || matchingList[0];
-
     try {
       const q = await getQuiz(id, type);
-      if (q && q.question) {
-        setQuiz({
-          ...targetQ,
-          ...q,
-          concept_id: q.concept_id || targetQ?.concept_id || id,
-          concept_name: q.concept_name || targetQ?.concept_name || concepts.find((c) => c.concept_id === id)?.canonical_name || "Optimization Concept",
-          category: q.category || targetQ?.category || "optimization",
-          key_takeaway: targetQ?.key_takeaway || "Review core concept fundamentals and source citations.",
-        });
-      } else {
-        setQuiz(targetQ);
-      }
-    } catch {
-      setQuiz(targetQ);
+      const questions = (q.questions || []).map((item: any, index: number) => ({
+        ...item,
+        id: String(item.id || `q${index + 1}`),
+        concept_id: q.concept_id || id,
+        concept_name: q.concept_name || concepts.find((c) => c.concept_id === id)?.canonical_name || "Selected concept",
+        question_type: q.question_type || type,
+        options: (item.options || []).map((option: any, optionIndex: number) => typeof option === "string" ? { id: option, text: option } : { id: String(option.id ?? optionIndex), text: option.text ?? String(option) }),
+        correct_id: item.correct_option_id ?? item.correct_id,
+        correct_keywords: item.correct_keywords ?? [],
+      }));
+      setQuizQuestions(questions);
+      setQuiz(questions[questionIdx] || questions[0] || null);
+    } catch (err) {
+      setQuiz(null);
+      setError(err instanceof Error ? err.message : "Could not generate a quiz for this concept.");
     } finally {
       setQuizBusy(false);
     }
@@ -371,7 +392,12 @@ export default function LearnPage() {
     setConceptStatus((prev) => ({ ...prev, [targetId]: normalizedStatus }));
     try {
       const conf = normalizedStatus === "learned" ? 1.0 : normalizedStatus === "review" ? 0.5 : 0.1;
-      await updateConceptProgress(targetId, normalizedStatus, conf);
+      // The UI has a distinct "dont_know" state, while the API stores both
+      // review and don't-know as a revisit requiring another attempt.
+      const apiStatus = normalizedStatus === "review" || normalizedStatus === "dont_know"
+        ? "revisit"
+        : normalizedStatus;
+      await updateConceptProgress(targetId, apiStatus, conf);
     } catch {
       // safe
     }
@@ -388,12 +414,12 @@ export default function LearnPage() {
       const keywords = quiz.correct_keywords || ["gradient", "derivative"];
       isCorrect = keywords.some((k: string) => answer.toLowerCase().includes(k.toLowerCase()));
     } else {
-      const correctId = quiz.correct_id || "opt_a";
+      const correctId = quiz.correct_id ?? "0";
       isCorrect = answer === correctId;
     }
 
     try {
-      const fb = await submitQuiz(quiz.concept_id || selectedId, qType, answer);
+      const fb = await submitQuiz(quiz.concept_id || selectedId, qType, quiz, answer);
       const resCorrect = typeof fb?.correct === "boolean" ? fb.correct : isCorrect;
       const resFb = {
         correct: resCorrect,
@@ -468,15 +494,14 @@ export default function LearnPage() {
   }
 
   function handleNextQuestion() {
-    const matchingList: QuizQuestionItem[] = [];
     const nextIdx = quizQuestionIdx + 1;
-    if (nextIdx >= matchingList.length) {
+    if (nextIdx >= quizQuestions.length) {
       setQuizFinished(true);
     } else {
       setQuizQuestionIdx(nextIdx);
-      const nextQ = matchingList[nextIdx];
-      setSelectedId(nextQ.concept_id);
-      loadQuiz(nextQ.concept_id, quizType, nextIdx);
+      setQuiz(quizQuestions[nextIdx]);
+      setAnswer("");
+      setFeedback(null);
     }
   }
 
@@ -491,12 +516,7 @@ export default function LearnPage() {
     setQuizHistory([]);
     setAnswer("");
     setFeedback(null);
-    const matchingList: QuizQuestionItem[] = [];
-    const firstQ = matchingList[0];
-    if (firstQ) {
-      setSelectedId(firstQ.concept_id);
-      loadQuiz(firstQ.concept_id, quizType, 0);
-    }
+    if (selectedId) loadQuiz(selectedId, quizType, 0);
   }
 
   function handleGoToFlashcard(conceptId: string) {
@@ -518,14 +538,7 @@ export default function LearnPage() {
     setAnswer("");
     setFeedback(null);
     setQuizFinished(false);
-    const matchingList: QuizQuestionItem[] = [];
-    const firstQ = matchingList[0];
-    if (firstQ) {
-      setSelectedId(firstQ.concept_id);
-      loadQuiz(firstQ.concept_id, type, 0);
-    } else {
-      loadQuiz(selectedId, type, 0);
-    }
+    if (selectedId) loadQuiz(selectedId, type, 0);
   }
 
   function handleSelectDeckFilter(filter: "all" | "dont_know" | "review" | "learned") {
@@ -743,123 +756,32 @@ export default function LearnPage() {
             VERIFIED PREREQUISITE ROADMAP
           </div>
 
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 10,
-              flexWrap: "wrap",
-            }}
-          >
-            {/* Node 1: Loss Function (Completed) */}
-            <button
-              onClick={() => handleSelectConcept("loss_function")}
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 6,
-                padding: "7px 15px",
-                borderRadius: 9999,
-                background: "#F5EEE8",
-                border: "1.5px solid #EAE4DE",
-                fontSize: 18.8,
-                fontWeight: 600,
-                color: "#171514",
-                cursor: "pointer",
-              }}
-            >
-              <CheckCircle2 size={15} color="#B98259" />
-              Loss Function
-            </button>
-
-            <span style={{ color: "#77716D", fontSize: 19.5 }}>→</span>
-
-            {/* Node 2: Gradient Vector (Completed) */}
-            <button
-              onClick={() => handleSelectConcept("gradient_vector")}
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 6,
-                padding: "7px 15px",
-                borderRadius: 9999,
-                background: "#F5EEE8",
-                border: "1.5px solid #EAE4DE",
-                fontSize: 18.8,
-                fontWeight: 600,
-                color: "#171514",
-                cursor: "pointer",
-              }}
-            >
-              <CheckCircle2 size={15} color="#B98259" />
-              Gradient Vector
-            </button>
-
-            <span style={{ color: "#77716D", fontSize: 19.5 }}>→</span>
-
-            {/* Node 3: Current Active Concept (Highlighted with brown border) */}
-            <div
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 7,
-                padding: "7px 18px",
-                borderRadius: 9999,
-                background: "#FFF9F5",
-                border: "2px solid #B98259",
-                fontSize: 19.5,
-                fontWeight: 700,
-                color: "#171514",
-                boxShadow: "0 1px 4px rgba(196, 125, 59, 0.12)",
-              }}
-            >
-              <Network size={16} color="#B98259" />
-              {activeConcept?.canonical_name || "Adam Optimizer"}
-            </div>
-
-            <span style={{ color: "#77716D", fontSize: 19.5 }}>→</span>
-
-            {/* Node 4: Gradient Descent */}
-            <button
-              onClick={() => handleSelectConcept("gradient_descent")}
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 6,
-                padding: "7px 15px",
-                borderRadius: 9999,
-                background: "#FAF7F4",
-                border: "1.5px solid #EAE4DE",
-                fontSize: 18.8,
-                fontWeight: 500,
-                color: "#77716D",
-                cursor: "pointer",
-              }}
-            >
-              Gradient Descent
-            </button>
-
-            <span style={{ color: "#77716D", fontSize: 19.5 }}>→</span>
-
-            {/* Node 5: Momentum */}
-            <button
-              onClick={() => handleSelectConcept("momentum")}
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 6,
-                padding: "7px 15px",
-                borderRadius: 9999,
-                background: "#FAF7F4",
-                border: "1.5px solid #EAE4DE",
-                fontSize: 18.8,
-                fontWeight: 500,
-                color: "#77716D",
-                cursor: "pointer",
-              }}
-            >
-              Momentum
-            </button>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            {roadmapNodes.length === 0 ? (
+              <span style={{ color: "#77716D", fontSize: 17 }}>Select a verified concept to view its prerequisite path.</span>
+            ) : roadmapNodes.map((node, index) => {
+              const isActive = node.concept_id === selectedId;
+              const status = conceptStatus[node.concept_id];
+              return (
+                <div key={node.concept_id} style={{ display: "inline-flex", alignItems: "center", gap: 10 }}>
+                  <button
+                    onClick={() => handleSelectConcept(node.concept_id)}
+                    title={`Study ${node.canonical_name}`}
+                    style={{
+                      display: "inline-flex", alignItems: "center", gap: 6, padding: "7px 15px",
+                      borderRadius: 9999, background: isActive ? "#FFF9F5" : status === "learned" ? "#F5EEE8" : "#FAF7F4",
+                      border: isActive ? "2px solid #B98259" : "1.5px solid #EAE4DE",
+                      fontSize: isActive ? 19.5 : 18.8, fontWeight: isActive ? 700 : 600,
+                      color: "#171514", cursor: "pointer",
+                    }}
+                  >
+                    {isActive ? <Network size={16} color="#B98259" /> : <CheckCircle2 size={15} color="#B98259" />}
+                    {node.canonical_name}
+                  </button>
+                  {index < roadmapNodes.length - 1 && <span style={{ color: "#77716D", fontSize: 19.5 }}>→</span>}
+                </div>
+              );
+            })}
           </div>
         </motion.div>
 
@@ -924,7 +846,10 @@ export default function LearnPage() {
           </button>
 
           <button
-            onClick={() => setActiveTab("quiz")}
+            onClick={() => {
+              setActiveTab("quiz");
+              if (selectedId) loadQuiz(selectedId, quizType);
+            }}
             style={{
               padding: "10px 20px",
               borderRadius: 12,
@@ -949,48 +874,10 @@ export default function LearnPage() {
         {/* Tab 1: Explanations */}
         {activeTab === "explain" && (
           <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }}>
-            {/* Explanation Sub-Modes Pills */}
-            <div style={{ display: "flex", gap: 10, marginBottom: 18, flexWrap: "wrap" }}>
-              {[
-                { id: "simple", label: "Simple" },
-                { id: "step_by_step", label: "Step-by-Step" },
-                { id: "source_example", label: "Source Example" },
-                { id: "compare", label: "Comparative" },
-              ].map((m) => {
-                const isActive = explainMode === m.id;
-                return (
-                  <button
-                    key={m.id}
-                    onClick={() => loadExplanation(selectedId, m.id as any)}
-                    style={{
-                      height: 34,
-                      padding: "0 18px",
-                      borderRadius: 9999,
-                      border: isActive ? "1.5px solid #DFC9B5" : "1.5px solid #EAE4DE",
-                      background: isActive ? "#F5EEE8" : "#FFFFFF",
-                      color: isActive ? "#171514" : "#77716D",
-                      fontSize: 18.8,
-                      fontWeight: isActive ? 700 : 500,
-                      cursor: "pointer",
-                      transition: "all 0.15s ease",
-                    }}
-                    onMouseOver={(e) => {
-                      if (!isActive) {
-                        e.currentTarget.style.borderColor = "#171514";
-                        e.currentTarget.style.background = "#FAF7F4";
-                      }
-                    }}
-                    onMouseOut={(e) => {
-                      if (!isActive) {
-                        e.currentTarget.style.borderColor = "#EAE4DE";
-                        e.currentTarget.style.background = "#FFFFFF";
-                      }
-                    }}
-                  >
-                    {m.label}
-                  </button>
-                );
-              })}
+            <div style={{ display: "flex", gap: 10, marginBottom: 18 }}>
+              <span style={{ height: 34, display: "inline-flex", alignItems: "center", padding: "0 18px", borderRadius: 9999, border: "1.5px solid #DFC9B5", background: "#F5EEE8", color: "#171514", fontSize: 18.8, fontWeight: 700 }}>
+                Simple grounded explanation
+              </span>
             </div>
 
             {/* Main Explanation Card */}
@@ -1060,10 +947,9 @@ export default function LearnPage() {
                     fontFamily: "var(--font-sans)",
                   }}
                 >
-                  {renderExplanationWithCitations(
-                    explanation.answer ||
-                    "Gradient Descent is an iterative optimization technique that adjusts model weights to minimize an objective loss function [1]. The algorithm traverses the cost surface by evaluating partial derivatives and stepping along the negative gradient direction [2]."
-                  )}
+                  {explanation.answer
+                    ? renderExplanationWithCitations(explanation.answer)
+                    : "The backend returned no grounded explanation for this concept. Check that the selected document has verified evidence."}
                 </div>
 
                 {/* Read Aloud Button */}
@@ -1102,22 +988,13 @@ export default function LearnPage() {
                 {/* Separator Divider */}
                 <div style={{ borderTop: "1px solid #F0E8E1", marginBottom: 20 }} />
 
-                {/* Verified Evidence Groundings */}
+                {/* Sources are hidden until the learner asks to inspect them. */}
                 <div>
-                  <div
-                    style={{
-                      fontSize: 16.5,
-                      fontWeight: 800,
-                      textTransform: "uppercase",
-                      letterSpacing: "0.06em",
-                      color: "#77716D",
-                      marginBottom: 16,
-                    }}
-                  >
-                    VERIFIED EVIDENCE GROUNDINGS
-                  </div>
+                  <button onClick={() => setShowSources((visible) => !visible)} style={{ height: 38, padding: "0 16px", borderRadius: 9999, border: "1.5px solid #EAE4DE", background: "#FAF7F4", color: "#4A3024", fontSize: 17, fontWeight: 700, cursor: "pointer" }}>
+                    {showSources ? "Hide sources" : "View sources"} ({activeCitations.length})
+                  </button>
 
-                  <div style={{ display: "flex", flexDirection: "column", gap: 16, position: "relative" }}>
+                  {showSources && <div style={{ display: "flex", flexDirection: "column", gap: 16, position: "relative", marginTop: 16 }}>
                     {/* Vertical connecting line between citation badges */}
                     {activeCitations.length > 1 && (
                       <div
@@ -1183,7 +1060,7 @@ export default function LearnPage() {
                         </div>
                       </div>
                     ))}
-                  </div>
+                  </div>}
                 </div>
               </div>
             ) : null}
@@ -2028,9 +1905,9 @@ export default function LearnPage() {
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18, flexWrap: "wrap", gap: 10 }}>
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                 {[
-                  { id: "multiple_choice", label: "Multiple Choice (5 Qs)" },
-                  { id: "short_answer", label: "Short Answer (3 Qs)" },
-                  { id: "relationship", label: "Relationship (2 Qs)" },
+                  { id: "multiple_choice", label: "Multiple Choice" },
+                  { id: "short_answer", label: "Short Answer" },
+                  { id: "relationship", label: "Relationship" },
                 ].map((t) => {
                   const isActive = quizType === t.id;
                   return (

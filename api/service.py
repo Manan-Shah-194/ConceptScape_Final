@@ -28,8 +28,9 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 from storage.database import SessionLocal, get_db, init_db
 from storage.models import (ChatMessage, ChatSession, ConceptProgress, DocumentRecord, DocumentVersion,
-                            LearningPathProgress, PipelineJob, QuizAttempt, ReviewAudit, ReviewItem, AuditLog, User, Workspace)
+                            LearningPathProgress, Notification, PipelineJob, QuizAttempt, ReviewAudit, ReviewItem, AuditLog, User, Workspace)
 from storage.paths import ensure_workspace_paths
+from learning.quiz import evaluate_answer, generate_quiz as generate_ai_quiz
 
 configure_logging()
 
@@ -136,7 +137,7 @@ class ChatRenameRequest(BaseModel):
 
 class ExplainRequest(BaseModel):
     concept_id: str = Field(..., min_length=1, max_length=160)
-    mode: str = Field(..., pattern="^(simple|step_by_step|source_example|compare)$")
+    mode: str = Field(default="simple", pattern="^simple$")
     session_id: Optional[str] = None
 
 
@@ -152,6 +153,11 @@ class PathProgressRequest(BaseModel):
 class QuizAttemptRequest(BaseModel):
     concept_id: str = Field(..., min_length=1, max_length=160)
     question_type: str = Field(default="multiple_choice", pattern="^(multiple_choice|short_answer|relationship)$")
+    question_id: str = Field(..., min_length=1, max_length=160)
+    question: str = Field(..., min_length=1, max_length=2000)
+    expected_answer: str = Field(default="", max_length=4000)
+    correct_option_id: str = Field(default="", max_length=100)
+    options: List[Dict[str, str]] = Field(default_factory=list)
     answer: str = Field(..., min_length=1, max_length=2000)
 
 
@@ -294,6 +300,40 @@ def list_workspace_members(workspace_id: str, user: User = Depends(current_user)
                         for member in workspace.members]}
 
 
+@app.get("/notifications")
+def notifications(user: User = Depends(current_user), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    rows = db.query(Notification).filter_by(user_id=user.id).order_by(Notification.created_at.desc()).limit(50).all()
+    return {"notifications": [{"id": row.id, "kind": row.kind, "status": row.status,
+                                "payload": json.loads(row.payload_json or "{}"),
+                                "created_at": row.created_at.isoformat()} for row in rows]}
+
+
+@app.post("/notifications/{notification_id}/respond")
+def respond_notification(notification_id: str, decision: Dict[str, str],
+                          user: User = Depends(current_user), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    row = db.query(Notification).filter_by(id=notification_id, user_id=user.id).first()
+    if row is None or row.kind != "workspace_invite" or row.status != "unread":
+        raise HTTPException(404, "Notification not found or already handled")
+    action = decision.get("action", "").lower()
+    if action not in {"accept", "decline"}:
+        raise HTTPException(400, "Action must be accept or decline")
+    payload = json.loads(row.payload_json or "{}")
+    workspace = db.query(Workspace).filter_by(id=payload.get("workspace_id")).first()
+    inviter = db.query(User).filter_by(id=payload.get("inviter_id")).first()
+    if workspace is None or inviter is None:
+        raise HTTPException(404, "Workspace or inviter no longer exists")
+    if action == "accept" and user not in workspace.members:
+        workspace.members.append(user)
+    row.status = "accepted" if action == "accept" else "declined"
+    feedback = Notification(user_id=inviter.id, kind="workspace_invite_result", status="unread",
+                            payload_json=json.dumps({"workspace_id": workspace.id, "workspace_name": workspace.name,
+                                                     "user_id": user.id, "user_name": user.display_name,
+                                                     "decision": action}))
+    db.add(feedback)
+    db.commit()
+    return {"status": row.status, "workspace_id": workspace.id if action == "accept" else None}
+
+
 @app.post("/workspaces/{workspace_id}/members")
 def add_workspace_member(workspace_id: str, req: WorkspaceMemberRequest,
                          user: User = Depends(current_user), db: Session = Depends(get_db)) -> Dict[str, Any]:
@@ -304,10 +344,15 @@ def add_workspace_member(workspace_id: str, req: WorkspaceMemberRequest,
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No account exists for that email")
     if member in workspace.members:
         raise HTTPException(status.HTTP_409_CONFLICT, "That user is already a workspace member")
-    workspace.members.append(member)
-    _audit(db, workspace.id, user.id, "workspace.member_add", "user", member.id, {"email": member.email})
+    existing = db.query(Notification).filter_by(user_id=member.id, kind="workspace_invite", status="unread").all()
+    if any(json.loads(item.payload_json or "{}").get("workspace_id") == workspace.id for item in existing):
+        raise HTTPException(status.HTTP_409_CONFLICT, "That user already has a pending invitation")
+    db.add(Notification(user_id=member.id, kind="workspace_invite", status="unread",
+                        payload_json=json.dumps({"workspace_id": workspace.id, "workspace_name": workspace.name,
+                                                 "inviter_id": user.id, "inviter_name": user.display_name})))
+    _audit(db, workspace.id, user.id, "workspace.invite_sent", "user", member.id, {"email": member.email})
     db.commit()
-    return {"id": member.id, "email": member.email, "display_name": member.display_name, "role": "member"}
+    return {"invited": True, "email": member.email}
 
 
 @app.delete("/workspaces/{workspace_id}/members/{member_id}")
@@ -324,6 +369,19 @@ def remove_workspace_member(workspace_id: str, member_id: str,
     _audit(db, workspace.id, user.id, "workspace.member_remove", "user", member.id)
     db.commit()
     return {"removed": member_id}
+
+
+@app.post("/workspaces/{workspace_id}/leave")
+def leave_workspace(workspace_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    workspace = workspace_for_user(workspace_id, user, db)
+    if user.id == workspace.created_by:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "The workspace owner cannot leave. Transfer ownership or delete the workspace.")
+    if user not in workspace.members:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "You are not a member of this workspace")
+    workspace.members.remove(user)
+    _audit(db, workspace.id, user.id, "workspace.leave", "user", user.id)
+    db.commit()
+    return {"left": workspace_id}
 
 
 @app.get("/chat/sessions")
@@ -580,13 +638,12 @@ def explain(req: ExplainRequest, user: User = Depends(current_user), workspace: 
     concept = next((n for n in data.get("nodes", []) if n.get("concept_id") == req.concept_id), None)
     if concept is None or not concept.get("evidence"):
         raise HTTPException(422, "This concept has no verified evidence for a grounded explanation")
-    prompts = {
-        "simple": "Explain this concept simply for a beginner using only the retrieved evidence.",
-        "step_by_step": "Explain this concept step by step using only the retrieved evidence.",
-        "source_example": "Give an example of this concept using an example explicitly present in the source evidence.",
-        "compare": "Compare this concept with closely related concepts, using only retrieved evidence and clearly mark missing comparisons.",
-    }
-    prompt = f"{prompts[req.mode]} Concept: {concept['canonical_name']}"
+    prompt = (
+        "Explain this concept clearly and in depth for a learner. Start with a plain-language definition, "
+        "then explain how it works, why it matters, and include a concrete example only when the retrieved "
+        "source evidence supports one. Use several well-structured paragraphs and only the retrieved evidence; "
+        "do not invent facts. Concept: " + concept["canonical_name"]
+    )
     answer = get_pipeline(workspace.id).ask(prompt).to_dict()
     session = db.query(ChatSession).filter_by(id=req.session_id, workspace_id=workspace.id).first() if req.session_id else None
     if session is None:
@@ -604,81 +661,85 @@ def metrics() -> Response:
     return Response(payload, media_type="text/plain; version=0.0.4")
 
 
-def _quiz_payload(data: Dict[str, Any], concept_id: str, question_type: str) -> Dict[str, Any]:
-    concept = next((n for n in data.get("nodes", []) if n.get("concept_id") == concept_id), None)
-    if not concept or not concept.get("evidence"):
-        raise HTTPException(422, "Quiz generation requires verified concept evidence")
-    evidence = concept["evidence"][0]
-    seed = hashlib.sha256(f"{concept_id}:{question_type}:{evidence}".encode()).hexdigest()[:16]
-    citations = [{"text": evidence, "filename": concept.get("filenames", [""])[0],
-                  "location": (concept.get("locations") or [{}])[0]}]
-    if question_type == "relationship":
-        edge = next((e for e in data.get("edges", []) if e.get("source_concept_id") == concept_id or e.get("target_concept_id") == concept_id), None)
-        if not edge:
-            raise HTTPException(422, "This concept has no verified relationship evidence for a relationship question")
-        other_id = edge["target_concept_id"] if edge["source_concept_id"] == concept_id else edge["source_concept_id"]
-        other = next((n for n in data.get("nodes", []) if n.get("concept_id") == other_id), {})
-        return {"question_id": seed, "concept_id": concept_id, "question_type": question_type,
-                "question": f"What verified relationship connects {concept['canonical_name']} and {other.get('canonical_name', other_id)}?",
-                "options": [edge["type"], "unrelated_to", "contradicts"], "correct": edge["type"], "citations": citations}
-    if question_type == "short_answer":
-        return {"question_id": seed, "concept_id": concept_id, "question_type": question_type,
-                "question": f"In your own words, what is {concept['canonical_name']} according to the source?",
-                "expected_terms": [word.casefold() for word in evidence.split()[:6] if len(word) > 3],
-                "citations": citations}
-    distractors = [n.get("definition") for n in data.get("nodes", []) if n.get("concept_id") != concept_id and n.get("definition") and n.get("evidence")][:2]
-    options = [concept.get("definition") or evidence, *distractors]
-    return {"question_id": seed, "concept_id": concept_id, "question_type": question_type,
-            "question": f"Which statement is supported by the evidence about {concept['canonical_name']}?",
-            "options": [{"id": str(i), "text": text} for i, text in enumerate(options)],
-            "correct": "0", "citations": citations}
-
-
 @app.get("/quiz/{concept_id}")
 def generate_quiz(concept_id: str, question_type: str = "multiple_choice", workspace: Workspace = Depends(current_workspace)) -> Dict[str, Any]:
     if question_type not in {"multiple_choice", "short_answer", "relationship"}:
         raise HTTPException(400, "Unsupported question type")
-    return _quiz_payload(_learning_graph(workspace), concept_id, question_type)
+    data = _learning_graph(workspace)
+    concept = next((node for node in data.get("nodes", []) if node.get("concept_id") == concept_id), None)
+    if concept is None:
+        raise HTTPException(404, "Concept not found in the active workspace graph")
+    related_ids = {
+        edge.get("target_concept_id") if edge.get("source_concept_id") == concept_id else edge.get("source_concept_id")
+        for edge in data.get("edges", [])
+        if concept_id in {edge.get("source_concept_id"), edge.get("target_concept_id")}
+    }
+    related = [node for node in data.get("nodes", []) if node.get("concept_id") in related_ids]
+    try:
+        generated = generate_ai_quiz(concept, related, question_type)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    citations = [{"text": text, "filename": (concept.get("filenames") or [""])[0],
+                  "location": (concept.get("locations") or [{}])[0]} for text in (concept.get("evidence") or [])[:3]]
+    return {"concept_id": concept_id, "concept_name": concept.get("canonical_name"),
+            "question_type": question_type, "questions": generated["questions"],
+            "citations": citations, "model_used": generated["model_used"]}
 
 
 @app.post("/quiz/attempts")
 def submit_quiz_attempt(req: QuizAttemptRequest, user: User = Depends(current_user), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
-    payload = _quiz_payload(_learning_graph(workspace), req.concept_id, req.question_type)
-    if req.question_type == "short_answer":
-        answer = req.answer.casefold()
-        terms = payload["expected_terms"]
-        correct = len([term for term in terms if term in answer]) >= max(2, len(terms) // 2)
-    else:
-        correct = req.answer == payload["correct"]
+    data = _learning_graph(workspace)
+    concept = next((node for node in data.get("nodes", []) if node.get("concept_id") == req.concept_id), None)
+    if concept is None:
+        raise HTTPException(404, "Concept not found in the active workspace graph")
+    question = {"id": req.question_id, "question": req.question, "expected_answer": req.expected_answer,
+                "correct_option_id": req.correct_option_id, "options": req.options}
+    evidence = "\n".join(concept.get("evidence") or [])
+    try:
+        evaluation = evaluate_answer(question, req.answer, evidence)
+    except Exception as exc:
+        raise HTTPException(503, f"Answer evaluation failed: {exc}") from exc
+    correct = bool(evaluation.get("correct"))
     score = 1.0 if correct else 0.0
+    citations = [{"text": text, "filename": (concept.get("filenames") or [""])[0],
+                  "location": (concept.get("locations") or [{}])[0]} for text in (concept.get("evidence") or [])[:3]]
     attempt = QuizAttempt(workspace_id=workspace.id, user_id=user.id, concept_id=req.concept_id,
-                          question_id=payload["question_id"], question_type=req.question_type,
+                          question_id=req.question_id, question_type=req.question_type,
                           answer=req.answer, correct=correct, score=score,
-                          explanation="Correct — supported by the cited evidence." if correct else "Review the cited evidence and try again.",
-                          citations_json=json.dumps(payload["citations"], ensure_ascii=False))
+                          explanation=evaluation.get("explanation", "Review the cited evidence."),
+                          citations_json=json.dumps(citations, ensure_ascii=False))
     db.add(attempt)
     progress = db.query(ConceptProgress).filter_by(workspace_id=workspace.id, user_id=user.id, concept_id=req.concept_id).first()
     if progress is None:
         progress = ConceptProgress(workspace_id=workspace.id, user_id=user.id, concept_id=req.concept_id)
         db.add(progress)
-    progress.confidence = (progress.confidence + score) / 2 if progress.view_count else score
+    previous_views = progress.view_count or 0
+    previous_confidence = progress.confidence or 0.0
+    progress.confidence = (previous_confidence + score) / 2 if previous_views else score
+    progress.view_count = previous_views + 1
     progress.needs_review = not correct
     progress.status = "learned" if correct else "revisit"
     db.commit()
-    return {"correct": correct, "score": score, "explanation": attempt.explanation, "citations": payload["citations"]}
+    return {"correct": correct, "score": score, "explanation": attempt.explanation,
+            "correct_answer": evaluation.get("correct_answer", req.expected_answer),
+            "key_takeaway": evaluation.get("key_takeaway", ""), "citations": citations}
 
 
 @app.post("/progress/concepts/{concept_id}")
 def update_concept_progress(concept_id: str, req: ProgressRequest, user: User = Depends(current_user), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
-    if not any(n.get("concept_id") == concept_id for n in _learning_graph(workspace).get("nodes", [])):
-        raise HTTPException(404, "Concept not found")
+    # The Learn page can still be displaying a concept from a freshly rebuilt
+    # graph while the in-memory pipeline/artifact cache is being refreshed.
+    # Progress is scoped to the authenticated workspace, so do not reject a
+    # valid client concept id merely because that cache is momentarily stale.
     progress = db.query(ConceptProgress).filter_by(workspace_id=workspace.id, user_id=user.id, concept_id=concept_id).first()
     if progress is None:
         progress = ConceptProgress(workspace_id=workspace.id, user_id=user.id, concept_id=concept_id)
         db.add(progress)
     progress.status = req.status
     progress.confidence = req.confidence
-    progress.view_count += 1
+    progress.view_count = (progress.view_count or 0) + 1
     progress.needs_review = req.status == "revisit"
     progress.last_viewed_at = datetime.now(timezone.utc)
     db.commit()
