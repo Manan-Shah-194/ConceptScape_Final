@@ -83,7 +83,7 @@ export default function UploadPage() {
       }
       setStatus(s);
     } catch {
-      // Backend may be offline or in demo mode; maintain demo documents
+      setError("Could not load documents or pipeline status. Check that the backend is running.");
     }
   }, []);
 
@@ -113,17 +113,7 @@ export default function UploadPage() {
       try {
         await uploadDocument(file);
       } catch (err: any) {
-        // Fallback to local state demo document
-        setDocs((prev) => [
-          {
-            filename: file.name,
-            suffix: file.name.slice(file.name.lastIndexOf(".")),
-            status: "completed",
-            version: 1,
-            size_bytes: file.size,
-          },
-          ...prev,
-        ]);
+        setError(err?.message || `Could not upload ${file.name}.`);
       }
     }
     await refresh();
@@ -164,10 +154,8 @@ export default function UploadPage() {
     try {
       await replaceDocument(name, file);
       await refresh();
-    } catch {
-      setDocs((prev) =>
-        prev.map((d) => (d.filename === name ? { ...d, filename: file.name, size_bytes: file.size } : d))
-      );
+    } catch (err: any) {
+      setError(err?.message || `Could not replace ${name}.`);
     } finally {
       setBusy(false);
     }
@@ -204,10 +192,8 @@ export default function UploadPage() {
       await addYouTube(url);
       setYoutubeUrl("");
       await refresh();
-    } catch {
-      const docName = url.includes("v=") ? `${url.split("v=")[1].slice(0, 11)}.yt` : "lecture_video.yt";
-      setDocs((prev) => [{ filename: docName, suffix: ".yt", status: "completed", version: 1, size_bytes: 0 }, ...prev]);
-      setYoutubeUrl("");
+    } catch (err: any) {
+      setError(err?.message || "Could not add the YouTube video.");
     } finally {
       setBusy(false);
     }
