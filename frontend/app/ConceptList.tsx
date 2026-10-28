@@ -123,7 +123,7 @@ export default function ConceptList({ concepts, edges, focusId, search, onSearch
         </div>
       </div>
 
-      <div className="concept-list">
+      <div className="concept-list" data-lenis-prevent="true">
         <motion.div variants={listVariant} initial="hidden" animate="visible">
           {shown.map((c) => {
             const d = degree.get(c.concept_id) ?? 0;

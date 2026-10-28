@@ -28,7 +28,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 from storage.database import SessionLocal, get_db, init_db
 from storage.models import (ChatMessage, ChatSession, ConceptProgress, DocumentRecord, DocumentVersion,
-                            LearningPathProgress, Notification, PipelineJob, QuizAttempt, ReviewAudit, ReviewItem, AuditLog, User, Workspace)
+                            LearningPathProgress, Notification, PipelineJob, QuizAttempt, AuditLog, User, Workspace)
 from storage.paths import ensure_workspace_paths
 from learning.quiz import evaluate_answer, generate_quiz as generate_ai_quiz
 
@@ -159,12 +159,6 @@ class QuizAttemptRequest(BaseModel):
     correct_option_id: str = Field(default="", max_length=100)
     options: List[Dict[str, str]] = Field(default_factory=list)
     answer: str = Field(..., min_length=1, max_length=2000)
-
-
-class ReviewRequest(BaseModel):
-    status: str = Field(..., pattern="^(pending|approved|rejected|edited)$")
-    note: Optional[str] = Field(default=None, max_length=2000)
-    edited: Optional[Dict[str, Any]] = None
 
 
 @app.post("/auth/register")
@@ -760,81 +754,36 @@ def update_path_progress(concept_id: str, req: PathProgressRequest, user: User =
 @app.get("/progress")
 def progress_dashboard(user: User = Depends(current_user), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
     items = db.query(ConceptProgress).filter_by(workspace_id=workspace.id, user_id=user.id).all()
+    paths = db.query(LearningPathProgress).filter_by(workspace_id=workspace.id, user_id=user.id).all()
     attempts = db.query(QuizAttempt).filter_by(workspace_id=workspace.id, user_id=user.id).all()
     graph_nodes = {node["concept_id"]: node for node in _learning_graph(workspace).get("nodes", [])}
     by_document: dict[str, list[float]] = {}
     by_topic: dict[str, list[float]] = {}
     for item in items:
         concept = graph_nodes.get(item.concept_id, {})
+        confidence = float(item.confidence or 0.0)
         for filename in concept.get("filenames", []) or ["Unknown source"]:
-            by_document.setdefault(filename, []).append(item.confidence)
+            by_document.setdefault(filename, []).append(confidence)
         topics = concept.get("keywords") or ["Uncategorized"]
         for topic in topics[:5]:
-            by_topic.setdefault(topic, []).append(item.confidence)
+            by_topic.setdefault(topic, []).append(confidence)
     summarize = lambda values: round(sum(values) / len(values), 3) if values else 0.0
-    return {"concepts": [{"concept_id": item.concept_id, "status": item.status, "confidence": item.confidence,
-                           "view_count": item.view_count, "needs_review": item.needs_review} for item in items],
+    correct = sum(1 for item in attempts if item.correct)
+    return {"total_concepts": len(graph_nodes), "tracked_concepts": len(items),
+            "learned_concepts": sum(1 for item in items if item.status == "learned"),
+            "overall_mastery": summarize([float(item.confidence or 0.0) for item in items]),
+            "concepts": [{"concept_id": item.concept_id,
+                           "concept_name": graph_nodes.get(item.concept_id, {}).get("canonical_name") or graph_nodes.get(item.concept_id, {}).get("label") or item.concept_id,
+                           "status": item.status, "confidence": float(item.confidence or 0.0),
+                           "view_count": int(item.view_count or 0), "needs_review": bool(item.needs_review)} for item in items],
             "quiz": {"attempts": len(attempts), "correct": sum(1 for item in attempts if item.correct),
-                     "accuracy": (sum(1 for item in attempts if item.correct) / len(attempts)) if attempts else 0.0},
+                     "accuracy": (correct / len(attempts)) if attempts else 0.0},
+            "paths": [{"concept_id": item.concept_id,
+                       "concept_name": graph_nodes.get(item.concept_id, {}).get("canonical_name") or graph_nodes.get(item.concept_id, {}).get("label") or item.concept_id,
+                       "status": item.status} for item in paths],
             "needs_review": [item.concept_id for item in items if item.needs_review],
             "by_document": [{"name": name, "mastery": summarize(values), "concepts": len(values)} for name, values in sorted(by_document.items())],
             "by_topic": [{"name": name, "mastery": summarize(values), "concepts": len(values)} for name, values in sorted(by_topic.items())]}
-
-
-@app.get("/quality/report")
-def quality_report(workspace: Workspace = Depends(current_workspace)) -> Dict[str, Any]:
-    data_dir = ensure_workspace_paths(workspace.id)["data"]
-    concepts_path = data_dir / "normalized_concepts.json"
-    relationships_path = data_dir / "relationships.json"
-    if not concepts_path.is_file() or not relationships_path.is_file():
-        raise HTTPException(404, "No normalized graph data exists yet. Run the pipeline first.")
-    from quality.report import build_quality_report_from_dir
-    report = build_quality_report_from_dir(data_dir)
-    (data_dir / "quality_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-    return report
-
-
-@app.get("/quality/reviews")
-def list_quality_reviews(workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
-    items = db.query(ReviewItem).filter_by(workspace_id=workspace.id).order_by(ReviewItem.updated_at.desc()).all()
-    return {"reviews": [{"id": item.id, "target_type": item.target_type, "target_id": item.target_id,
-                          "status": item.status, "note": item.note, "edited": json.loads(item.edited_json) if item.edited_json else None,
-                          "updated_at": item.updated_at.isoformat()} for item in items]}
-
-
-@app.patch("/quality/reviews/{target_type}/{target_id}")
-def update_quality_review(target_type: str, target_id: str, req: ReviewRequest,
-                          user: User = Depends(current_user), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
-    if target_type not in {"concept", "relationship"}:
-        raise HTTPException(400, "Unsupported review target type")
-    data = _learning_graph(workspace)
-    valid = (any(item.get("concept_id") == target_id for item in data.get("nodes", [])) if target_type == "concept"
-             else any(item.get("relationship_id") == target_id for item in data.get("edges", [])))
-    if not valid:
-        raise HTTPException(404, "Review target not found in the immutable graph artefact")
-    item = db.query(ReviewItem).filter_by(workspace_id=workspace.id, target_type=target_type, target_id=target_id).first()
-    before = {"status": item.status, "note": item.note, "edited": json.loads(item.edited_json) if item and item.edited_json else None} if item else None
-    if item is None:
-        item = ReviewItem(workspace_id=workspace.id, target_type=target_type, target_id=target_id, updated_by=user.id)
-        db.add(item); db.flush()
-    item.status = req.status; item.note = req.note; item.edited_json = json.dumps(req.edited, ensure_ascii=False) if req.edited else None; item.updated_by = user.id
-    db.add(ReviewAudit(review_item_id=item.id, user_id=user.id, action=req.status,
-                       before_json=json.dumps(before, ensure_ascii=False) if before else None,
-                       after_json=json.dumps({"status": req.status, "note": req.note, "edited": req.edited}, ensure_ascii=False)))
-    db.commit()
-    return {"target_type": target_type, "target_id": target_id, "status": item.status,
-            "note": item.note, "edited": req.edited, "provenance_unchanged": True}
-
-
-@app.get("/quality/reviews/{target_type}/{target_id}/audit")
-def quality_review_audit(target_type: str, target_id: str, workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
-    item = db.query(ReviewItem).filter_by(workspace_id=workspace.id, target_type=target_type, target_id=target_id).first()
-    if item is None:
-        return {"audit": []}
-    rows = db.query(ReviewAudit).filter_by(review_item_id=item.id).order_by(ReviewAudit.created_at.asc()).all()
-    return {"audit": [{"action": row.action, "before": json.loads(row.before_json) if row.before_json else None,
-                        "after": json.loads(row.after_json) if row.after_json else None,
-                        "created_at": row.created_at.isoformat()} for row in rows]}
 
 
 @app.get("/concepts")

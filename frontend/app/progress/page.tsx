@@ -16,7 +16,7 @@ import {
 } from "lucide-react";
 import { Navbar } from "@/components/Navbar";
 import { Footer } from "@/components/Footer";
-import { getProgress } from "@/lib/api";
+import { getGraph, getProgress } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 
 function RadialGauge({ percent = 88, size = 68 }: { percent?: number; size?: number }) {
@@ -112,35 +112,43 @@ export default function ProgressPage() {
   // screen whose entire purpose is reporting how much you actually know.
   const [data, setData] = useState<any>(null);
   const [error, setError] = useState("");
+  const [topicFilter, setTopicFilter] = useState("all");
+  const [topicSort, setTopicSort] = useState("mastery_desc");
 
   useEffect(() => {
     if (!getToken()) {
       router.replace("/login");
       return;
     }
-    getProgress()
-      .then((res) => {
-        if (res && res.quiz && res.by_document) {
-          // If concepts array has items, use them, otherwise maintain the standard demo list
-          const mergedConcepts =
-            res.concepts ?? [];
-          setData({
-            ...res,
-            concepts: mergedConcepts,
-          });
-        }
+    Promise.all([getProgress(), getGraph()])
+      .then(([res, graph]) => {
+        const names = new Map((graph?.nodes ?? []).map((node: any) => [node.concept_id, node.canonical_name || node.name || node.label]));
+        setData({
+          ...res,
+          concepts: (res?.concepts ?? []).map((item: any) => ({
+            ...item,
+            concept_name: item.concept_name && !item.concept_name.startsWith("concept_")
+              ? item.concept_name
+              : names.get(item.concept_id) || item.concept_name || item.concept_id,
+          })),
+          paths: (res?.paths ?? []).map((item: any) => ({
+            ...item,
+            concept_name: names.get(item.concept_id) || item.concept_name || item.concept_id,
+          })),
+        });
       })
       .catch((e) => {
-        // Fallback to default demo progress data
         setError(e.message || "");
       });
   }, [router]);
 
-  const quizAccuracy = Math.round((data?.quiz?.accuracy ?? 0.88) * 100);
-  const quizCorrect = data?.quiz?.correct ?? 22;
-  const quizAttempts = data?.quiz?.attempts ?? 25;
+  const quizAccuracy = Math.round((data?.quiz?.accuracy ?? 0) * 100);
+  const quizCorrect = data?.quiz?.correct ?? 0;
+  const quizAttempts = data?.quiz?.attempts ?? 0;
   const docsList = data?.by_document ?? [];
-  const topicsList = data?.by_topic ?? [];
+  const topicsList = [...(data?.by_topic ?? [])]
+    .filter((topic: any) => topicFilter === "all" || (topicFilter === "completed" ? topic.mastery >= 1 : topic.mastery < 1))
+    .sort((a: any, b: any) => topicSort === "name" ? a.name.localeCompare(b.name) : topicSort === "mastery_asc" ? a.mastery - b.mastery : b.mastery - a.mastery);
   const conceptsList = data?.concepts ?? [];
 
   const renderDocIcon = (filename: string) => {
@@ -370,7 +378,7 @@ export default function ProgressPage() {
             {/* Document Rows */}
             <div style={{ display: "flex", flexDirection: "column" }}>
               {docsList.map((doc: any, i: number) => {
-                const masteryPct = Math.round((doc.mastery ?? 0.8) * 100);
+                const masteryPct = Math.round((doc.mastery ?? 0) * 100);
                 return (
                   <div
                     key={doc.name || i}
@@ -404,7 +412,7 @@ export default function ProgressPage() {
 
                     {/* Accuracy Progress Bar + Number */}
                     <div style={{ width: 140, display: "flex", alignItems: "center", gap: 10 }}>
-                      <ProgressBar value={doc.mastery ?? 0.8} width={80} />
+                      <ProgressBar value={doc.mastery ?? 0} width={80} />
                       <span style={{ fontSize: 18, fontWeight: 700, color: "#2D1E15" }}>
                         {masteryPct}%
                       </span>
@@ -473,6 +481,19 @@ export default function ProgressPage() {
               </div>
             </div>
 
+            <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+              <select value={topicFilter} onChange={(e) => setTopicFilter(e.target.value)} style={{ padding: "7px 10px", borderRadius: 8, border: "1px solid #E8DDD5", color: "#4A2818" }}>
+                <option value="all">All topics</option>
+                <option value="completed">Completed</option>
+                <option value="active">In progress</option>
+              </select>
+              <select value={topicSort} onChange={(e) => setTopicSort(e.target.value)} style={{ padding: "7px 10px", borderRadius: 8, border: "1px solid #E8DDD5", color: "#4A2818" }}>
+                <option value="mastery_desc">Highest mastery</option>
+                <option value="mastery_asc">Lowest mastery</option>
+                <option value="name">Name</option>
+              </select>
+            </div>
+
             {/* Table Header */}
             <div
               style={{
@@ -495,9 +516,9 @@ export default function ProgressPage() {
             </div>
 
             {/* Topic Rows */}
-            <div style={{ display: "flex", flexDirection: "column" }}>
+            <div data-lenis-prevent="true" style={{ display: "flex", flexDirection: "column", maxHeight: 360, overflowY: "auto", overscrollBehavior: "contain", paddingRight: 4 }}>
               {topicsList.map((topic: any, i: number) => {
-                const masteryPct = Math.round((topic.mastery ?? 0.8) * 100);
+                const masteryPct = Math.round((topic.mastery ?? 0) * 100);
                 return (
                   <div
                     key={topic.name || i}
@@ -545,7 +566,7 @@ export default function ProgressPage() {
 
                     {/* Accuracy Progress Bar + Number */}
                     <div style={{ width: 140, display: "flex", alignItems: "center", gap: 10 }}>
-                      <ProgressBar value={topic.mastery ?? 0.8} width={80} />
+                      <ProgressBar value={topic.mastery ?? 0} width={80} />
                       <span style={{ fontSize: 18, fontWeight: 700, color: "#2D1E15" }}>
                         {masteryPct}%
                       </span>
@@ -641,7 +662,7 @@ export default function ProgressPage() {
           <div style={{ display: "flex", flexDirection: "column" }}>
             {conceptsList.map((item: any, i: number) => {
               const isLearned = item.status === "learned";
-              const confVal = typeof item.confidence === "number" ? item.confidence : 0.8;
+              const confVal = typeof item.confidence === "number" ? item.confidence : 0;
 
               return (
                 <div
@@ -670,7 +691,7 @@ export default function ProgressPage() {
                       paddingRight: 12,
                     }}
                   >
-                    {item.concept_id}
+                    {item.concept_name || item.concept_id}
                   </div>
 
                   {/* Status Badge */}

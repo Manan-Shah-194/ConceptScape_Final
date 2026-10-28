@@ -46,7 +46,6 @@ export function Navbar({ rightSlot }: { rightSlot?: React.ReactNode }) {
     { name: "Workspace", path: "/workspace" },
     { name: "Learn", path: "/learn" },
     { name: "Progress", path: "/progress" },
-    { name: "Quality", path: "/quality" },
   ];
 
   return (

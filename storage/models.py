@@ -175,33 +175,6 @@ class QuizAttempt(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
 
-class ReviewItem(Base):
-    __tablename__ = "review_items"
-    __table_args__ = (UniqueConstraint("workspace_id", "target_type", "target_id"),)
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
-    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), index=True)
-    target_type: Mapped[str] = mapped_column(String(32))
-    target_id: Mapped[str] = mapped_column(String(160))
-    status: Mapped[str] = mapped_column(String(20), default="pending")
-    note: Mapped[str | None] = mapped_column(Text, nullable=True)
-    edited_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    updated_by: Mapped[str] = mapped_column(ForeignKey("users.id"))
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
-
-
-class ReviewAudit(Base):
-    __tablename__ = "review_audits"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
-    review_item_id: Mapped[str] = mapped_column(ForeignKey("review_items.id", ondelete="CASCADE"), index=True)
-    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
-    action: Mapped[str] = mapped_column(String(32))
-    before_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    after_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
-
-
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 

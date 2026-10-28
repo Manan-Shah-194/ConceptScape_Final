@@ -492,26 +492,6 @@ export async function getProgress(): Promise<any> {
     { headers: authHeaders() });
 }
 
-export async function getQualityReport(): Promise<any> {
-  return apiFetch(
-    `${API_BASE}/quality/report`,
-    { headers: authHeaders() });
-}
-
-export async function reviewQuality(
-  targetType: string,
-  targetId: string,
-  status: string,
-  note?: string
-): Promise<void> {
-  await apiSend(`${API_BASE}/quality/reviews/${targetType}/${encodeURIComponent(targetId)}`, {
-    method: "PATCH",
-    headers: authHeaders(true),
-    body: JSON.stringify({ status, note }),
-  });
-}
-
-
 export async function runPipeline(): Promise<void> {
   await apiSend(`${API_BASE}/pipeline/run`, { method: "POST", headers: authHeaders() });
 }
