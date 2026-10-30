@@ -28,8 +28,8 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 from storage.database import SessionLocal, get_db, init_db
 from storage.models import (ChatMessage, ChatSession, ConceptProgress, DocumentRecord, DocumentVersion,
-                            LearningPathProgress, Notification, PipelineJob, QuizAttempt, AuditLog, User, Workspace)
-from storage.paths import ensure_workspace_paths
+                            LearningPathProgress, Notification, PipelineJob, QuizAttempt, AuditLog, Subject, User, Workspace)
+from storage.paths import ensure_subject_paths, ensure_workspace_paths
 from learning.quiz import evaluate_answer, generate_quiz as generate_ai_quiz
 
 configure_logging()
@@ -161,6 +161,10 @@ class QuizAttemptRequest(BaseModel):
     answer: str = Field(..., min_length=1, max_length=2000)
 
 
+class SubjectRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=160)
+
+
 @app.post("/auth/register")
 def register(req: RegisterRequest, db: Session = Depends(get_db)) -> Dict[str, Any]:
     email = req.email.strip().casefold()
@@ -254,6 +258,41 @@ def current_workspace(
     workspace = workspace_for_user(x_workspace_id, user, db)
     ensure_workspace_paths(workspace.id)
     return workspace
+
+
+def subject_for_workspace(subject_id: str, workspace: Workspace, db: Session) -> Subject:
+    subject = db.query(Subject).filter_by(id=subject_id, workspace_id=workspace.id).first()
+    if subject is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Subject not found in this workspace")
+    return subject
+
+
+@app.get("/subjects")
+def list_subjects(workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    subjects = db.query(Subject).filter_by(workspace_id=workspace.id).order_by(Subject.name.asc()).all()
+    return {"subjects": [{"id": item.id, "name": item.name, "document_count": len(item.documents)} for item in subjects]}
+
+
+@app.post("/subjects")
+def create_subject(req: SubjectRequest, workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    name = req.name.strip()
+    if db.query(Subject).filter_by(workspace_id=workspace.id, name=name).first():
+        raise HTTPException(status.HTTP_409_CONFLICT, "A subject with this name already exists")
+    subject = Subject(workspace_id=workspace.id, name=name)
+    db.add(subject)
+    db.commit()
+    db.refresh(subject)
+    return {"id": subject.id, "name": subject.name, "document_count": 0}
+
+
+@app.delete("/subjects/{subject_id}")
+def delete_subject(subject_id: str, workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    subject = subject_for_workspace(subject_id, workspace, db)
+    if subject.documents:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Move or delete the subject's documents before deleting the subject")
+    db.delete(subject)
+    db.commit()
+    return {"deleted": subject_id}
 
 
 def _require_owner(workspace: Workspace, user: User) -> None:
@@ -518,9 +557,14 @@ def health() -> Dict[str, Any]:
 @app.get("/graph")
 def graph(document: str | None = Query(default=None), relation_type: str | None = Query(default=None),
           min_confidence: float = Query(default=0.0, ge=0.0, le=1.0), connected_only: bool = False,
-          source: str | None = Query(default=None), workspace: Workspace = Depends(current_workspace)) -> Dict[str, Any]:
-    paths = ensure_workspace_paths(workspace.id)
-    data = _load(str(paths["data"] / "graph_export.json"))
+          source: str | None = Query(default=None), x_subject_id: str | None = Header(default=None), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    data = _graph_data(workspace, x_subject_id)
+    if x_subject_id:
+        subject_for_workspace(x_subject_id, workspace, db)
+        subject_files = {item.filename for item in db.query(DocumentRecord).filter_by(workspace_id=workspace.id, subject_id=x_subject_id).all()}
+        data["nodes"] = [node for node in data.get("nodes", []) if subject_files.intersection(node.get("filenames", []))]
+        node_ids = {node.get("concept_id") for node in data["nodes"]}
+        data["edges"] = [edge for edge in data.get("edges", []) if edge.get("source_concept_id") in node_ids and edge.get("target_concept_id") in node_ids]
     edges = data.get("edges", [])
     if relation_type:
         edges = [e for e in edges if e.get("type") == relation_type]
@@ -540,7 +584,11 @@ def graph(document: str | None = Query(default=None), relation_type: str | None 
     return {"nodes": nodes, "edges": edges}
 
 
-def _graph_data(workspace: Workspace) -> Dict[str, Any]:
+def _graph_data(workspace: Workspace, subject_id: str | None = None) -> Dict[str, Any]:
+    if subject_id:
+        subject_graph = ensure_subject_paths(workspace.id, subject_id)["data"] / "graph_export.json"
+        if subject_graph.is_file():
+            return _load(str(subject_graph))
     return _load(str(ensure_workspace_paths(workspace.id)["data"] / "graph_export.json"))
 
 
@@ -592,13 +640,20 @@ def graph_prerequisites(concept_id: str, workspace: Workspace = Depends(current_
             "edges": [e for e in data.get("edges", []) if e.get("source_concept_id") in keep and e.get("target_concept_id") in keep]}
 
 
-def _learning_graph(workspace: Workspace) -> Dict[str, Any]:
-    return _graph_data(workspace)
+def _learning_graph(workspace: Workspace, subject_id: str | None = None, db: Session | None = None) -> Dict[str, Any]:
+    data = _graph_data(workspace, subject_id)
+    if subject_id and db is not None:
+        subject_for_workspace(subject_id, workspace, db)
+        subject_files = {item.filename for item in db.query(DocumentRecord).filter_by(workspace_id=workspace.id, subject_id=subject_id).all()}
+        data["nodes"] = [node for node in data.get("nodes", []) if subject_files.intersection(node.get("filenames", []))]
+        node_ids = {node.get("concept_id") for node in data["nodes"]}
+        data["edges"] = [edge for edge in data.get("edges", []) if edge.get("source_concept_id") in node_ids and edge.get("target_concept_id") in node_ids]
+    return data
 
 
 @app.get("/learning-paths/{concept_id}")
-def learning_path(concept_id: str, user: User = Depends(current_user), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
-    data = _learning_graph(workspace)
+def learning_path(concept_id: str, x_subject_id: str | None = Header(default=None), user: User = Depends(current_user), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    data = _learning_graph(workspace, x_subject_id, db)
     nodes = {n["concept_id"]: n for n in data.get("nodes", [])}
     if concept_id not in nodes:
         raise HTTPException(404, "Concept not found")
@@ -627,8 +682,8 @@ def learning_path(concept_id: str, user: User = Depends(current_user), workspace
 
 
 @app.post("/explain")
-def explain(req: ExplainRequest, user: User = Depends(current_user), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
-    data = _learning_graph(workspace)
+def explain(req: ExplainRequest, x_subject_id: str | None = Header(default=None), user: User = Depends(current_user), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    data = _learning_graph(workspace, x_subject_id, db)
     concept = next((n for n in data.get("nodes", []) if n.get("concept_id") == req.concept_id), None)
     if concept is None or not concept.get("evidence"):
         raise HTTPException(422, "This concept has no verified evidence for a grounded explanation")
@@ -656,10 +711,10 @@ def metrics() -> Response:
 
 
 @app.get("/quiz/{concept_id}")
-def generate_quiz(concept_id: str, question_type: str = "multiple_choice", workspace: Workspace = Depends(current_workspace)) -> Dict[str, Any]:
+def generate_quiz(concept_id: str, question_type: str = "multiple_choice", x_subject_id: str | None = Header(default=None), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
     if question_type not in {"multiple_choice", "short_answer", "relationship"}:
         raise HTTPException(400, "Unsupported question type")
-    data = _learning_graph(workspace)
+    data = _learning_graph(workspace, x_subject_id, db)
     concept = next((node for node in data.get("nodes", []) if node.get("concept_id") == concept_id), None)
     if concept is None:
         raise HTTPException(404, "Concept not found in the active workspace graph")
@@ -683,8 +738,8 @@ def generate_quiz(concept_id: str, question_type: str = "multiple_choice", works
 
 
 @app.post("/quiz/attempts")
-def submit_quiz_attempt(req: QuizAttemptRequest, user: User = Depends(current_user), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
-    data = _learning_graph(workspace)
+def submit_quiz_attempt(req: QuizAttemptRequest, x_subject_id: str | None = Header(default=None), user: User = Depends(current_user), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    data = _learning_graph(workspace, x_subject_id, db)
     concept = next((node for node in data.get("nodes", []) if node.get("concept_id") == req.concept_id), None)
     if concept is None:
         raise HTTPException(404, "Concept not found in the active workspace graph")
@@ -752,19 +807,41 @@ def update_path_progress(concept_id: str, req: PathProgressRequest, user: User =
 
 
 @app.get("/progress")
-def progress_dashboard(user: User = Depends(current_user), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
+def progress_dashboard(x_subject_id: str | None = Header(default=None), user: User = Depends(current_user), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
     items = db.query(ConceptProgress).filter_by(workspace_id=workspace.id, user_id=user.id).all()
     paths = db.query(LearningPathProgress).filter_by(workspace_id=workspace.id, user_id=user.id).all()
     attempts = db.query(QuizAttempt).filter_by(workspace_id=workspace.id, user_id=user.id).all()
-    graph_nodes = {node["concept_id"]: node for node in _learning_graph(workspace).get("nodes", [])}
+    graph_nodes = {node["concept_id"]: node for node in _learning_graph(workspace, x_subject_id, db).get("nodes", [])}
+    # A subject scope must apply to learning state as well as graph data.
+    # Otherwise progress rows from another subject leak into the selected view.
+    items = [item for item in items if item.concept_id in graph_nodes]
+    paths = [item for item in paths if item.concept_id in graph_nodes]
+    attempts = [item for item in attempts if item.concept_id in graph_nodes]
+    progress_by_concept = {item.concept_id: item for item in items}
+    concept_rows = [{
+        "concept_id": concept_id,
+        "concept_name": node.get("canonical_name") or node.get("label") or concept_id,
+        "status": progress_by_concept[concept_id].status if concept_id in progress_by_concept else "not_started",
+        "confidence": float(progress_by_concept[concept_id].confidence or 0.0) if concept_id in progress_by_concept else 0.0,
+        "view_count": int(progress_by_concept[concept_id].view_count or 0) if concept_id in progress_by_concept else 0,
+        "needs_review": bool(progress_by_concept[concept_id].needs_review) if concept_id in progress_by_concept else False,
+    } for concept_id, node in graph_nodes.items()]
     by_document: dict[str, list[float]] = {}
     by_topic: dict[str, list[float]] = {}
-    for item in items:
-        concept = graph_nodes.get(item.concept_id, {})
-        confidence = float(item.confidence or 0.0)
+    by_subject: dict[str, list[float]] = {}
+    subject_names = {
+        item.filename: (item.subject.name if item.subject is not None else "Unassigned")
+        for item in db.query(DocumentRecord).filter_by(workspace_id=workspace.id).all()
+    }
+    for concept_id, concept in graph_nodes.items():
+        progress = progress_by_concept.get(concept_id)
+        confidence = float(progress.confidence or 0.0) if progress is not None else 0.0
         for filename in concept.get("filenames", []) or ["Unknown source"]:
             by_document.setdefault(filename, []).append(confidence)
-        topics = concept.get("keywords") or ["Uncategorized"]
+            by_subject.setdefault(subject_names.get(filename, "Unassigned"), []).append(confidence)
+        topics = [str(topic).strip() for topic in (concept.get("keywords") or []) if str(topic).strip()]
+        if not topics:
+            topics = [concept.get("canonical_name") or "Other"]
         for topic in topics[:5]:
             by_topic.setdefault(topic, []).append(confidence)
     summarize = lambda values: round(sum(values) / len(values), 3) if values else 0.0
@@ -772,10 +849,7 @@ def progress_dashboard(user: User = Depends(current_user), workspace: Workspace 
     return {"total_concepts": len(graph_nodes), "tracked_concepts": len(items),
             "learned_concepts": sum(1 for item in items if item.status == "learned"),
             "overall_mastery": summarize([float(item.confidence or 0.0) for item in items]),
-            "concepts": [{"concept_id": item.concept_id,
-                           "concept_name": graph_nodes.get(item.concept_id, {}).get("canonical_name") or graph_nodes.get(item.concept_id, {}).get("label") or item.concept_id,
-                           "status": item.status, "confidence": float(item.confidence or 0.0),
-                           "view_count": int(item.view_count or 0), "needs_review": bool(item.needs_review)} for item in items],
+            "concepts": concept_rows,
             "quiz": {"attempts": len(attempts), "correct": sum(1 for item in attempts if item.correct),
                      "accuracy": (correct / len(attempts)) if attempts else 0.0},
             "paths": [{"concept_id": item.concept_id,
@@ -783,6 +857,7 @@ def progress_dashboard(user: User = Depends(current_user), workspace: Workspace 
                        "status": item.status} for item in paths],
             "needs_review": [item.concept_id for item in items if item.needs_review],
             "by_document": [{"name": name, "mastery": summarize(values), "concepts": len(values)} for name, values in sorted(by_document.items())],
+            "by_subject": [{"name": name, "mastery": summarize(values), "concepts": len(values)} for name, values in sorted(by_subject.items())],
             "by_topic": [{"name": name, "mastery": summarize(values), "concepts": len(values)} for name, values in sorted(by_topic.items())]}
 
 
@@ -921,22 +996,27 @@ def _finish_latest_job(workspace_id: str) -> None:
 def get_runner(workspace_id: str) -> PipelineRunner:
     runner = _runners.get(workspace_id)
     if runner is None:
-        runner = PipelineRunner(on_complete=lambda wid: (_invalidate_pipeline(wid), _finish_latest_job(wid)))
+        runner = PipelineRunner(on_complete=lambda wid: (_invalidate_pipeline(wid), _finish_latest_job(wid.split("::", 1)[0])))
         _runners[workspace_id] = runner
     return runner
 
 
 @app.get("/documents")
-def documents(q: str = "", status_filter: str | None = None, workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
+def documents(q: str = "", status_filter: str | None = None, x_subject_id: str | None = Header(default=None), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
     d = ensure_workspace_paths(workspace.id)["documents"]
     if not d.is_dir():
         return {"documents": []}
-    records = {record.filename: record for record in db.query(DocumentRecord).filter_by(workspace_id=workspace.id).all()}
+    if x_subject_id:
+        subject_for_workspace(x_subject_id, workspace, db)
+    records = {record.filename: record for record in db.query(DocumentRecord).filter_by(workspace_id=workspace.id).all()
+               if not x_subject_id or record.subject_id == x_subject_id}
     items = []
     for f in sorted(d.iterdir()):
         if not f.is_file() or f.suffix.lower() not in ALLOWED_SUFFIXES:
             continue
         record = records.get(f.name)
+        if x_subject_id and record is None:
+            continue
         item = {"filename": f.name, "size_bytes": f.stat().st_size, "suffix": f.suffix.lower(),
                 "status": record.status if record else "uploaded", "error": record.error if record else None,
                 "version": record.version if record else 1,
@@ -961,9 +1041,10 @@ def documents(q: str = "", status_filter: str | None = None, workspace: Workspac
 
 
 @app.post("/documents")
-async def upload(files: List[UploadFile] = File(...), user: User = Depends(current_user), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
+async def upload(files: List[UploadFile] = File(...), x_subject_id: str | None = Header(default=None), user: User = Depends(current_user), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
     d = ensure_workspace_paths(workspace.id)["documents"]
     d.mkdir(parents=True, exist_ok=True)
+    subject = subject_for_workspace(x_subject_id, workspace, db) if x_subject_id else None
 
     saved, rejected = [], []
     for f in files:
@@ -1001,6 +1082,7 @@ async def upload(files: List[UploadFile] = File(...), user: User = Depends(curre
         destination.write_bytes(content)
         db.add(DocumentRecord(
             workspace_id=workspace.id,
+            subject_id=subject.id if subject else None,
             filename=name,
             source_type=Path(name).suffix.lower().lstrip("."),
             content_hash=hashlib.sha256(content).hexdigest(),
@@ -1146,13 +1228,17 @@ def add_youtube(req: YouTubeRequest, user: User = Depends(current_user), workspa
 
 
 @app.delete("/documents/{filename}")
-def delete_document(filename: str, user: User = Depends(current_user), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
+def delete_document(filename: str, x_subject_id: str | None = Header(default=None), user: User = Depends(current_user), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
     name = _safe_name(filename)
     path = ensure_workspace_paths(workspace.id)["documents"] / name
     if not path.is_file():
         raise HTTPException(404, f"No document named {name}")
     path.unlink()
     record = db.query(DocumentRecord).filter_by(workspace_id=workspace.id, filename=name).first()
+    if x_subject_id:
+        subject_for_workspace(x_subject_id, workspace, db)
+        if record is None or record.subject_id != x_subject_id:
+            raise HTTPException(404, f"No document named {name} in this subject")
     if record:
         db.delete(record)
     _audit(db, workspace.id, user.id, "document.delete", "document", name)
@@ -1162,7 +1248,18 @@ def delete_document(filename: str, user: User = Depends(current_user), workspace
 
 
 @app.post("/pipeline/run")
-def pipeline_run(user: User = Depends(current_user), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
+def pipeline_run(x_subject_id: str | None = Header(default=None), user: User = Depends(current_user), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    scope_id = workspace.id
+    if x_subject_id:
+        subject = subject_for_workspace(x_subject_id, workspace, db)
+        subject_paths = ensure_subject_paths(workspace.id, subject.id)
+        source_dir = ensure_workspace_paths(workspace.id)["documents"]
+        subject_paths["documents"].mkdir(parents=True, exist_ok=True)
+        for record in db.query(DocumentRecord).filter_by(workspace_id=workspace.id, subject_id=subject.id).all():
+            source = source_dir / record.filename
+            if source.is_file():
+                shutil.copy2(source, subject_paths["documents"] / record.filename)
+        scope_id = f"{workspace.id}::{subject.id}"
     job = PipelineJob(workspace_id=workspace.id, status="queued", started_at=datetime.now(timezone.utc))
     db.add(job)
     db.flush()
@@ -1173,7 +1270,7 @@ def pipeline_run(user: User = Depends(current_user), workspace: Workspace = Depe
         job.status = "queued"
         db.commit()
         return {"started": True, "queued": True, "job_id": job.id}
-    result = get_runner(workspace.id).start(workspace.id)
+    result = get_runner(scope_id).start(scope_id)
     if not result.get("started"):
         job.status = "rejected"
         job.error = result.get("reason")
@@ -1186,8 +1283,11 @@ def pipeline_run(user: User = Depends(current_user), workspace: Workspace = Depe
 
 
 @app.get("/pipeline/status")
-def pipeline_status(workspace: Workspace = Depends(current_workspace)) -> Dict[str, Any]:
-    state = get_runner(workspace.id).state
+def pipeline_status(x_subject_id: str | None = Header(default=None), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    if x_subject_id:
+        subject_for_workspace(x_subject_id, workspace, db)
+    scope_id = f"{workspace.id}::{x_subject_id}" if x_subject_id else workspace.id
+    state = get_runner(scope_id).state
     db = SessionLocal()
     try:
         job = (db.query(PipelineJob).filter_by(workspace_id=workspace.id)

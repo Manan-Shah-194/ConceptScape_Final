@@ -46,6 +46,9 @@ class Workspace(Base):
     documents: Mapped[list["DocumentRecord"]] = relationship(
         back_populates="workspace", cascade="all, delete-orphan"
     )
+    subjects: Mapped[list["Subject"]] = relationship(
+        back_populates="workspace", cascade="all, delete-orphan"
+    )
     chat_sessions: Mapped[list["ChatSession"]] = relationship(
         back_populates="workspace", cascade="all, delete-orphan"
     )
@@ -62,12 +65,25 @@ class Notification(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
 
+class Subject(Base):
+    __tablename__ = "subjects"
+    __table_args__ = (UniqueConstraint("workspace_id", "name"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(160))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    workspace: Mapped[Workspace] = relationship(back_populates="subjects")
+    documents: Mapped[list["DocumentRecord"]] = relationship(back_populates="subject")
+
+
 class DocumentRecord(Base):
     __tablename__ = "documents"
     __table_args__ = (UniqueConstraint("workspace_id", "filename"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.id", ondelete="CASCADE"), index=True)
+    subject_id: Mapped[str | None] = mapped_column(ForeignKey("subjects.id", ondelete="SET NULL"), index=True, nullable=True)
     filename: Mapped[str] = mapped_column(String(255))
     source_type: Mapped[str] = mapped_column(String(32))
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -77,6 +93,7 @@ class DocumentRecord(Base):
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     workspace: Mapped[Workspace] = relationship(back_populates="documents")
+    subject: Mapped[Subject | None] = relationship(back_populates="documents")
 
 
 class DocumentVersion(Base):

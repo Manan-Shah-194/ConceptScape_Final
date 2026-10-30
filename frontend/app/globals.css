@@ -1326,7 +1326,7 @@ button, input, select, textarea {
 
 /* ── Enhanced Graph Controls ─────────────────────────────────────────── */
 .graph-toolbar {
-  position: absolute; top: 75px; left: 24px; z-index: 10;
+  position: absolute; top: 116px; left: 24px; z-index: 10;
   display: flex; gap: 6px; align-items: center;
   background: var(--glass-bg); backdrop-filter: blur(var(--glass-blur));
   padding: 5px 8px; border-radius: 6px; border: 1px solid var(--border);
@@ -1346,7 +1346,7 @@ button, input, select, textarea {
 /* ── Upper-Right Graph Navigation Controls (Reference Inspiration) ────── */
 .graph-zoom-controls {
   position: absolute;
-  top: 75px;
+  top: 116px;
   right: 20px;
   z-index: 10;
   display: flex;

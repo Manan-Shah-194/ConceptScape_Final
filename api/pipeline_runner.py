@@ -116,9 +116,15 @@ class PipelineRunner:
         }
 
         from config import settings
-        from storage.paths import ensure_workspace_paths
+        from storage.paths import ensure_subject_paths, ensure_workspace_paths
 
-        paths = ensure_workspace_paths(workspace_id)
+        if "::" in workspace_id:
+            base_workspace_id, subject_id = workspace_id.split("::", 1)
+            paths = ensure_subject_paths(base_workspace_id, subject_id)
+            collection_scope = f"workspace_{base_workspace_id}_subject_{subject_id}"
+        else:
+            paths = ensure_workspace_paths(workspace_id)
+            collection_scope = f"workspace_{workspace_id}"
         previous_paths = (settings.documents_dir, settings.output_dir, settings.data_dir,
                           settings.qdrant_path, settings.qdrant_collection_prefix)
         SETTINGS_LOCK.acquire()
@@ -126,7 +132,7 @@ class PipelineRunner:
         settings.output_dir = str(paths["output"])
         settings.data_dir = str(paths["data"])
         settings.qdrant_path = str(paths["vectors"])
-        settings.qdrant_collection_prefix = f"workspace_{workspace_id}"
+        settings.qdrant_collection_prefix = collection_scope
 
         try:
             for key, _ in STAGES:

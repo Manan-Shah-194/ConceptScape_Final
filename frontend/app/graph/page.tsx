@@ -11,11 +11,12 @@ import ReactFlow, {
   type ReactFlowInstance,
 } from "reactflow";
 import { motion, AnimatePresence } from "framer-motion";
-import { Maximize2, Compass, Layers, GitFork, Plus, Minus } from "lucide-react";
+import { Maximize2, Compass, Layers, GitFork, Plus, Minus, PanelRightOpen, PanelRightClose } from "lucide-react";
 import ConceptList from "../ConceptList";
 import ConceptNode from "../ConceptNode";
 import DetailPanel from "../DetailPanel";
 import { Navbar } from "@/components/Navbar";
+import { SubjectSelector } from "@/components/SubjectSelector";
 import { getGraph } from "@/lib/api";
 import { getToken } from "@/lib/auth";
 import {
@@ -53,10 +54,16 @@ function GraphWorkspace() {
   const [confidence, setConfidence] = useState(0);
   const [connectedOnly, setConnectedOnly] = useState(false);
   const [rfInstance, setRfInstance] = useState<ReactFlowInstance | null>(null);
+  const [detailOpen, setDetailOpen] = useState(true);
+  const [subjectReady, setSubjectReady] = useState(false);
 
   useEffect(() => {
     if (!getToken()) {
       router.replace("/login");
+      return;
+    }
+    if (!subjectReady) {
+      setSubjectReady(true);
       return;
     }
     getGraph({
@@ -91,7 +98,7 @@ function GraphWorkspace() {
           `Check the API is running (python run_api.py), then upload documents and run the pipeline.`
         )
       );
-  }, [router, documentFilter, relationFilter, confidence, connectedOnly, searchParams]);
+  }, [router, documentFilter, relationFilter, confidence, connectedOnly, searchParams, subjectReady]);
 
   const conceptsById = useMemo(() => {
     const m: Record<string, Concept> = {};
@@ -157,6 +164,9 @@ function GraphWorkspace() {
   return (
     <div className="layout" style={{ paddingTop: 0 }}>
       <Navbar />
+      <div style={{ position: "absolute", top: 62, left: 280, zIndex: 20 }}>
+        <SubjectSelector compact manage={false} onChange={() => window.location.reload()} />
+      </div>
 
       <ConceptList
         concepts={graph.nodes}
@@ -300,6 +310,15 @@ function GraphWorkspace() {
           >
             <Maximize2 size={14} />
           </button>
+          <div className="graph-zoom-divider" />
+          <button
+            className="graph-zoom-btn"
+            onClick={() => setDetailOpen((open) => !open)}
+            title={detailOpen ? "Collapse details" : "Open details"}
+            aria-label={detailOpen ? "Collapse details" : "Open details"}
+          >
+            {detailOpen ? <PanelRightClose size={14} /> : <PanelRightOpen size={14} />}
+          </button>
         </div>
 
         <ReactFlow
@@ -352,7 +371,7 @@ function GraphWorkspace() {
         </AnimatePresence>
       </div>
 
-      <DetailPanel
+      {detailOpen && <DetailPanel
         concept={focus}
         edges={graph.edges as ConceptEdge[]}
         conceptsById={conceptsById}
@@ -361,7 +380,7 @@ function GraphWorkspace() {
           setOverview(false);
         }}
         onClose={() => setFocusId(null)}
-      />
+      />}
     </div>
   );
 }

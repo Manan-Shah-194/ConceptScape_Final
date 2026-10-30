@@ -6,7 +6,6 @@ import { motion } from "framer-motion";
 import {
   Target,
   FileText,
-  Presentation,
   Layers,
   BarChart2,
   Lightbulb,
@@ -16,8 +15,8 @@ import {
 } from "lucide-react";
 import { Navbar } from "@/components/Navbar";
 import { Footer } from "@/components/Footer";
-import { getGraph, getProgress } from "@/lib/api";
-import { getToken } from "@/lib/auth";
+import { getGraph, getProgress, listSubjects } from "@/lib/api";
+import { getSubjectId, getToken, setSubjectId } from "@/lib/auth";
 
 function RadialGauge({ percent = 88, size = 68 }: { percent?: number; size?: number }) {
   const strokeWidth = 7;
@@ -114,6 +113,8 @@ export default function ProgressPage() {
   const [error, setError] = useState("");
   const [topicFilter, setTopicFilter] = useState("all");
   const [topicSort, setTopicSort] = useState("mastery_desc");
+  const [subjects, setSubjects] = useState<Array<{ id: string; name: string; document_count?: number }>>([]);
+  const [selectedSubjectId, setSelectedSubjectId] = useState("");
 
   useEffect(() => {
     if (!getToken()) {
@@ -140,7 +141,22 @@ export default function ProgressPage() {
       .catch((e) => {
         setError(e.message || "");
       });
-  }, [router]);
+  }, [router, selectedSubjectId]);
+
+  useEffect(() => {
+    listSubjects().then((items) => {
+      setSubjects(items);
+      const saved = getSubjectId();
+      if (saved && items.some((item) => item.id === saved)) {
+        setSelectedSubjectId(saved);
+        setSubjectId(saved);
+      }
+      else if (items.length === 1) {
+        setSelectedSubjectId(items[0].id);
+        setSubjectId(items[0].id);
+      }
+    }).catch(() => setSubjects([]));
+  }, []);
 
   const quizAccuracy = Math.round((data?.quiz?.accuracy ?? 0) * 100);
   const quizCorrect = data?.quiz?.correct ?? 0;
@@ -153,40 +169,9 @@ export default function ProgressPage() {
 
   const renderDocIcon = (filename: string) => {
     const ext = filename.split(".").pop()?.toLowerCase();
-    if (ext === "pptx" || ext === "ppt") {
-      return (
-        <div
-          style={{
-            width: 28,
-            height: 28,
-            borderRadius: 7,
-            background: "#FAF0E6",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            color: "#E07A5F",
-            flexShrink: 0,
-          }}
-        >
-          <Presentation size={15} />
-        </div>
-      );
-    }
     return (
-      <div
-        style={{
-          width: 28,
-          height: 28,
-          borderRadius: 7,
-          background: "#FAF0E6",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          color: "#D9534F",
-          flexShrink: 0,
-        }}
-      >
-        <FileText size={15} />
+      <div style={{ width: 28, height: 28, borderRadius: 7, background: "#FAF0E6", display: "flex", alignItems: "center", justifyContent: "center", color: ext === "pptx" || ext === "ppt" ? "#E07A5F" : "#D9534F", flexShrink: 0 }}>
+        {ext === "pptx" || ext === "ppt" ? <Layers size={15} /> : <FileText size={15} />}
       </div>
     );
   };
@@ -482,6 +467,19 @@ export default function ProgressPage() {
             </div>
 
             <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+              <select
+                aria-label="Filter progress by subject"
+                value={selectedSubjectId}
+                onChange={(event) => {
+                  const next = event.target.value;
+                  setSelectedSubjectId(next);
+                  setSubjectId(next || null);
+                }}
+                style={{ padding: "7px 10px", borderRadius: 8, border: "1px solid #E8DDD5", color: "#4A2818" }}
+              >
+                <option value="">All subjects</option>
+                {subjects.map((subject) => <option key={subject.id} value={subject.id}>{subject.name}</option>)}
+              </select>
               <select value={topicFilter} onChange={(e) => setTopicFilter(e.target.value)} style={{ padding: "7px 10px", borderRadius: 8, border: "1px solid #E8DDD5", color: "#4A2818" }}>
                 <option value="all">All topics</option>
                 <option value="completed">Completed</option>
@@ -659,7 +657,19 @@ export default function ProgressPage() {
           </div>
 
           {/* Concept Rows */}
-          <div style={{ display: "flex", flexDirection: "column" }}>
+          <div
+            data-lenis-prevent="true"
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              maxHeight: "min(520px, 60vh)",
+              overflowY: "auto",
+              overscrollBehavior: "contain",
+              paddingRight: 4,
+              scrollbarWidth: "thin",
+              scrollbarColor: "#B87345 #F7F0E8",
+            }}
+          >
             {conceptsList.map((item: any, i: number) => {
               const isLearned = item.status === "learned";
               const confVal = typeof item.confidence === "number" ? item.confidence : 0;
