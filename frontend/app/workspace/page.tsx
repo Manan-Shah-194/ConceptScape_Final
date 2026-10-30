@@ -557,7 +557,7 @@ export default function WorkspaceSettingsPage() {
   const PIPELINE_STAGES = [
     { id: 1, title: "1. Ingest & OCR", sub: "PDF/PPTX parsing", detail: "PaddleOCR bilingual extraction with angle recovery" },
     { id: 2, title: "2. Clean & Chunk", sub: "Token overlap", detail: "512-token overlap window normalization" },
-    { id: 3, title: "3. Concept Extr.", sub: "LLM extraction", detail: "Gemini 1.5 Flash candidate concept taxonomy" },
+    { id: 3, title: "3. Concept Extr.", sub: "LLM extraction", detail: "Gemini 3.6 Flash candidate concept taxonomy" },
     { id: 4, title: "4. Entity Resol.", sub: "Alias merging", detail: "Fuzzy cosine alignment & entity deduplication" },
     { id: 5, title: "5. Relation Extr.", sub: "Typed triples", detail: "Directed dependency triples (requires, produces)" },
     { id: 6, title: "6. Graph Build", sub: "Dagre layout", detail: "Radial Dagre coordinate topology layout" },
@@ -583,7 +583,7 @@ export default function WorkspaceSettingsPage() {
       },
       {
         stage: 2,
-        log: "Stage 3/7: Gemini 1.5 Flash & LLaMA 3.3 extracting candidate concepts & formal definitions...",
+        log: "Stage 3/7: Gemini 3.6 Flash & LLaMA 3.3 extracting candidate concepts & formal definitions...",
         stats: { docs: workspaceDocuments.length, chunks: 42, concepts: 14, edges: 8 },
       },
       {
@@ -2383,7 +2383,7 @@ export default function WorkspaceSettingsPage() {
                     >
                       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                         <span style={{ fontSize: 19.5, fontWeight: 700, color: "#FFFFFF" }}>
-                          Google Gemini 1.5 Flash
+                          Google Gemini 3.6 Flash
                         </span>
                         <Check size={16} color="#E5B892" strokeWidth={3} />
                       </div>
