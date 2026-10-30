@@ -44,7 +44,7 @@ import { getToken } from "@/lib/auth";
 const PIPELINE_STAGES = [
   { id: 1, title: "1. Ingest & OCR", sub: "PDF/PPTX parsing", detail: "PaddleOCR bilingual extraction active" },
   { id: 2, title: "2. Clean & Chunk", sub: "Token overlap", detail: "Generating 512-token chunks with 64-token overlap" },
-  { id: 3, title: "3. Concept Extr.", sub: "LLM extraction", detail: "Gemini 1.5 Flash identifying candidate entities" },
+  { id: 3, title: "3. Concept Extr.", sub: "LLM extraction", detail: "Gemini 3.6 Flash identifying candidate entities" },
   { id: 4, title: "4. Entity Resol.", sub: "Alias merging", detail: "Merging synonyms & computing embeddings similarity" },
   { id: 5, title: "5. Relation Extr.", sub: "Typed triples", detail: "Extracting prerequisites, dependencies & hierarchies" },
   { id: 6, title: "6. Graph Build", sub: "Dagre layout", detail: "Constructing DAG hierarchy & node coordinates" },
