@@ -492,6 +492,21 @@ export async function getProgress(): Promise<any> {
     { headers: authHeaders() });
 }
 
+export type Subject = { id: string; name: string; document_count?: number };
+
+export async function listSubjects(): Promise<Subject[]> {
+  const response = await apiFetch<{ subjects: Subject[] }>(`${API_BASE}/subjects`, { headers: authHeaders() });
+  return response.subjects;
+}
+
+export async function createSubject(name: string): Promise<Subject> {
+  return apiFetch<Subject>(`${API_BASE}/subjects`, { method: "POST", headers: authHeaders(true), body: JSON.stringify({ name }) });
+}
+
+export async function deleteSubject(id: string): Promise<void> {
+  await apiSend(`${API_BASE}/subjects/${encodeURIComponent(id)}`, { method: "DELETE", headers: authHeaders() });
+}
+
 export async function runPipeline(): Promise<void> {
   await apiSend(`${API_BASE}/pipeline/run`, { method: "POST", headers: authHeaders() });
 }

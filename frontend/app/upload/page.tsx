@@ -39,7 +39,8 @@ import {
 } from "@/lib/api";
 import { Navbar } from "@/components/Navbar";
 import { Footer } from "@/components/Footer";
-import { getToken } from "@/lib/auth";
+import { getSubjectId, getToken, setSubjectId } from "@/lib/auth";
+import { createSubject, deleteSubject, listSubjects, type Subject } from "@/lib/api";
 
 const PIPELINE_STAGES = [
   { id: 1, title: "1. Ingest & OCR", sub: "PDF/PPTX parsing", detail: "PaddleOCR bilingual extraction active" },
@@ -61,6 +62,10 @@ export default function UploadPage() {
   const [youtubeUrl, setYoutubeUrl] = useState("");
   const [search, setSearch] = useState("");
   const [preview, setPreview] = useState<{ name: string; url?: string } | null>(null);
+  const [subjects, setSubjects] = useState<Subject[]>([]);
+  const [selectedSubjectId, setSelectedSubjectId] = useState("");
+  const [hydrated, setHydrated] = useState(false);
+  const [newSubjectName, setNewSubjectName] = useState("");
 
   // Simulation state for interactive demonstration mode
   const [simulating, setSimulating] = useState(false);
@@ -73,7 +78,7 @@ export default function UploadPage() {
   const refresh = useCallback(async () => {
     try {
       const [d, s] = await Promise.all([listDocuments(), getStatus()]);
-      if (d && Array.isArray(d.documents) && d.documents.length > 0) {
+      if (d && Array.isArray(d.documents)) {
         setDocs([...d.documents].sort((a, b) => {
           const pending = (value?: string) => value !== "processed" && value !== "error";
           const group = Number(pending(b.status)) - Number(pending(a.status));
@@ -88,14 +93,46 @@ export default function UploadPage() {
   }, []);
 
   useEffect(() => {
+    setHydrated(true);
     if (!getToken()) {
       router.replace("/login");
       return;
     }
+    listSubjects().then((items) => {
+      setSubjects(items);
+      const saved = getSubjectId();
+      if (saved && items.some((item) => item.id === saved)) setSelectedSubjectId(saved);
+      else if (items.length === 1) { setSelectedSubjectId(items[0].id); setSubjectId(items[0].id); }
+    }).catch(() => setSubjects([]));
     refresh();
     const t = setInterval(refresh, 2500);
     return () => clearInterval(t);
   }, [refresh, router]);
+
+  const handleCreateSubject = async () => {
+    if (!newSubjectName.trim()) return;
+    try {
+      const created = await createSubject(newSubjectName.trim());
+      setSubjects((prev) => [...prev, created].sort((a, b) => a.name.localeCompare(b.name)));
+      setSelectedSubjectId(created.id);
+      setSubjectId(created.id);
+      setNewSubjectName("");
+      await refresh();
+    } catch (err: any) { setError(err?.message || "Could not create subject."); }
+  };
+
+  const handleDeleteSubject = async () => {
+    const subject = subjects.find((item) => item.id === selectedSubjectId);
+    if (!subject || !confirm(`Delete subject '${subject.name}'? It must be empty first.`)) return;
+    try {
+      await deleteSubject(subject.id);
+      const remaining = subjects.filter((item) => item.id !== subject.id);
+      setSubjects(remaining);
+      setSelectedSubjectId(remaining[0]?.id || "");
+      setSubjectId(remaining[0]?.id || null);
+      await refresh();
+    } catch (err: any) { setError(err?.message || "Could not delete subject."); }
+  };
 
   const runSimulation = () => {
     setError("Demo simulation is disabled. Run the backend pipeline to see real progress.");
@@ -104,6 +141,7 @@ export default function UploadPage() {
   const onDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     setDrag(false);
+    if (!selectedSubjectId) { setError("Select a subject before uploading documents."); return; }
     if (busy) return;
     setBusy(true);
     setError("");
@@ -184,6 +222,7 @@ export default function UploadPage() {
   };
 
   const onAddYouTube = async () => {
+    if (!selectedSubjectId) { setError("Select a subject before adding a video."); return; }
     if (busy || !youtubeUrl.trim()) return;
     setBusy(true);
     setError("");
@@ -260,7 +299,7 @@ export default function UploadPage() {
 
             <button
               onClick={onRun}
-              disabled={docs.length === 0 || isRunning || busy}
+              disabled={!hydrated || docs.length === 0 || !selectedSubjectId || isRunning || busy}
               style={{
                 height: 34,
                 padding: "0 20px",
@@ -270,14 +309,14 @@ export default function UploadPage() {
                 color: "#FFFFFF",
                 fontSize: 18.8,
                 fontWeight: 600,
-                cursor: docs.length === 0 || isRunning ? "not-allowed" : "pointer",
+                cursor: !hydrated || docs.length === 0 || !selectedSubjectId || isRunning ? "not-allowed" : "pointer",
                 display: "inline-flex",
                 alignItems: "center",
                 gap: 6,
                 boxShadow: "0 2px 8px rgba(74, 40, 24, 0.2)",
               }}
             >
-              {isRunning ? "Pipeline Running…" : "Run Pipeline"}
+              {isRunning ? "Pipeline Running…" : !hydrated || selectedSubjectId ? "Run Pipeline" : "Select Subject First"}
               <Play size={13} />
             </button>
           </div>
@@ -330,6 +369,29 @@ export default function UploadPage() {
         </motion.div>
       )}
 
+      <div style={{ marginBottom: 20, padding: "16px 20px", border: "1px solid #E8DDD5", borderRadius: 14, background: "#FFFCFA" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+          <div style={{ flex: "1 1 240px" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <Layers size={20} color="#B87345" />
+              <h2 style={{ margin: 0, fontSize: 20, color: "#4A2818" }}>Subject workspace</h2>
+            </div>
+            <p style={{ margin: "4px 0 0 30px", color: "#77716D", fontSize: 14 }}>Documents, pipeline output and graph are isolated by subject.</p>
+          </div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <label style={{ fontSize: 14, color: "#6E5B4F", fontWeight: 600 }}>Current subject</label>
+            <select aria-label="Document subject" value={selectedSubjectId} onChange={async (event) => { const next = event.target.value; setSelectedSubjectId(next); setSubjectId(next || null); setDocs([]); if (next) await refresh(); }} style={{ minWidth: 180, padding: "9px 10px", borderRadius: 8, border: "1px solid #D8C8BD", background: "#FFFFFF" }}>
+              <option value="">Select subject</option>
+              {subjects.map((subject) => <option key={subject.id} value={subject.id}>{subject.name} ({subject.document_count ?? 0})</option>)}
+            </select>
+            <button onClick={handleDeleteSubject} disabled={!selectedSubjectId} style={{ padding: "9px 12px", borderRadius: 8, border: "1px solid #E2B8B8", background: selectedSubjectId ? "#FFF5F5" : "#F7F3F0", color: selectedSubjectId ? "#991B1B" : "#A99B92", cursor: selectedSubjectId ? "pointer" : "not-allowed" }}>Delete subject</button>
+            <div style={{ width: 1, height: 28, background: "#E8DDD5", margin: "0 2px" }} />
+            <input value={newSubjectName} onChange={(event) => setNewSubjectName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") handleCreateSubject(); }} placeholder="New subject name" style={{ width: 165, padding: "9px 10px", borderRadius: 8, border: "1px solid #D8C8BD" }} />
+            <button onClick={handleCreateSubject} style={{ padding: "9px 14px", borderRadius: 8, border: "none", background: "#4A3024", color: "#FFFFFF", cursor: "pointer" }}>Create subject</button>
+          </div>
+        </div>
+      </div>
+
       {/* 1. Drag & Drop Documents Here Card */}
       <motion.div
         initial={{ opacity: 0, y: 18 }}
@@ -371,23 +433,15 @@ export default function UploadPage() {
           style={{ display: "none" }}
           onClick={(e) => e.stopPropagation()}
           onChange={async (e) => {
+            if (!selectedSubjectId) { setError("Select a subject before uploading documents."); return; }
             if (busy || !e.target.files) return;
             setBusy(true);
             setError("");
             for (const file of Array.from(e.target.files)) {
               try {
                 await uploadDocument(file);
-              } catch {
-                setDocs((prev) => [
-                  {
-                    filename: file.name,
-                    suffix: file.name.slice(file.name.lastIndexOf(".")),
-                    status: "completed",
-                    version: 1,
-                    size_bytes: file.size,
-                  },
-                  ...prev,
-                ]);
+              } catch (err: any) {
+                setError(err?.message || `Could not upload ${file.name}.`);
               }
             }
             await refresh();

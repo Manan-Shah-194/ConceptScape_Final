@@ -30,6 +30,7 @@ import {
   BarChart3,
 } from "lucide-react";
 import { Navbar } from "@/components/Navbar";
+import { SubjectSelector } from "@/components/SubjectSelector";
 import { Footer } from "@/components/Footer";
 import {
   explainConcept,
@@ -650,6 +651,7 @@ export default function LearnPage() {
       <Navbar />
 
       <main style={{ maxWidth: "min(1560px, 96vw)", margin: "0 auto", width: "100%", padding: "76px clamp(16px, 3vw, 40px) 60px", boxSizing: "border-box", flex: 1 }}>
+        <SubjectSelector compact manage={false} onChange={() => window.location.reload()} />
         {error && (
           <div
             style={{

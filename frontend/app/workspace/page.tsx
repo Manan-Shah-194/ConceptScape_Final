@@ -49,7 +49,7 @@ import {
 } from "lucide-react";
 import { Navbar } from "@/components/Navbar";
 import { Footer } from "@/components/Footer";
-import { getToken, getUserProfile, getWorkspaceId, initialsOf, setWorkspaceId } from "@/lib/auth";
+import { getToken, getUserProfile, getSubjectId, getWorkspaceId, initialsOf, setSubjectId, setWorkspaceId } from "@/lib/auth";
 import {
   createWorkspace,
   deleteWorkspace,
@@ -61,6 +61,8 @@ import {
   renameWorkspace,
   removeMember,
   leaveWorkspace,
+  listSubjects,
+  type Subject,
 } from "@/lib/api";
 
 export type WorkspaceItem = {
@@ -119,6 +121,27 @@ function formatWhen(iso?: string | null): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "\u2014";
   return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+}
+
+function mapWorkspaceDocuments(documents: Array<{
+  filename: string;
+  suffix?: string;
+  version?: number;
+  size_bytes?: number;
+  status?: string;
+  uploaded_at?: string;
+}>) {
+  return documents.map((d, i) => ({
+    id: `${d.filename}-${i}`,
+    name: d.filename,
+    type: (d.suffix || "").replace(".", "") || "file",
+    version: `v${d.version ?? 1}`,
+    size: formatBytes(d.size_bytes ?? 0),
+    status: d.status ?? "ready",
+    origin: "uploaded" as const,
+    uploadedBy: "You",
+    date: formatWhen(d.uploaded_at),
+  }));
 }
 
 function appearanceFor(id: string): { icon: WorkspaceItem["icon"]; color: string; bgLight: string } {
@@ -256,6 +279,8 @@ export default function WorkspaceSettingsPage() {
     date: string;
   }>>([]);
   const [docOriginFilter, setDocOriginFilter] = useState<"all" | "uploaded" | "shared">("all");
+  const [subjects, setSubjects] = useState<Subject[]>([]);
+  const [selectedSubjectId, setSelectedSubjectId] = useState("");
 
   // Save workspaces to localStorage
   // Load the caller's real workspaces, with the counts the server can answer for.
@@ -327,19 +352,7 @@ export default function WorkspaceSettingsPage() {
       try {
         const { documents } = await listDocuments();
         if (cancelled) return;
-        setWorkspaceDocuments(
-          documents.map((d, i) => ({
-            id: `${d.filename}-${i}`,
-            name: d.filename,
-            type: (d.suffix || "").replace(".", "") || "file",
-            version: `v${d.version ?? 1}`,
-            size: formatBytes(d.size_bytes),
-            status: d.status ?? "ready",
-            origin: "uploaded" as const,
-            uploadedBy: "You",
-            date: formatWhen(d.uploaded_at),
-          }))
-        );
+        setWorkspaceDocuments(mapWorkspaceDocuments(documents));
       } catch {
         if (!cancelled) setWorkspaceDocuments([]);
       }
@@ -347,6 +360,27 @@ export default function WorkspaceSettingsPage() {
     return () => {
       cancelled = true;
     };
+  }, [selectedId, selectedSubjectId]);
+
+  // Keep the overview cards in the same subject scope as the Documents tab.
+  useEffect(() => {
+    if (!selectedId || !selectedSubjectId) return;
+    let cancelled = false;
+    Promise.all([listDocuments(), getGraph()]).then(([documents, graph]) => {
+      if (cancelled) return;
+      setWorkspaces((previous) => previous.map((workspace) => workspace.id === selectedId
+        ? { ...workspace, docs: documents.documents.length, concepts: graph.nodes.length }
+        : workspace));
+    }).catch(() => {
+      // The document effect below owns the visible error state.
+    });
+    return () => { cancelled = true; };
+  }, [selectedId, selectedSubjectId]);
+
+  useEffect(() => {
+    if (selectedId) refreshSubjects();
+    // Subject selection is workspace-scoped and must refresh when the user
+    // switches workspaces.
   }, [selectedId]);
 
   // Members of whichever workspace is selected.
@@ -512,6 +546,28 @@ export default function WorkspaceSettingsPage() {
       }
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : "Could not leave workspace.");
+    }
+  };
+
+  const refreshSubjects = async () => {
+    try {
+      const items = await listSubjects();
+      setSubjects(items);
+      const saved = getSubjectId();
+      if (saved && items.some((item) => item.id === saved)) {
+        setSelectedSubjectId(saved);
+        return;
+      }
+      if (selectedSubjectId && items.some((item) => item.id === selectedSubjectId)) return;
+      if (items.length) {
+        setSelectedSubjectId(items[0].id);
+        setSubjectId(items[0].id);
+      } else {
+        setSelectedSubjectId("");
+        setSubjectId(null);
+      }
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : "Could not load subjects.");
     }
   };
 
@@ -1471,6 +1527,34 @@ export default function WorkspaceSettingsPage() {
                     </button>
                   </div>
                 )}
+              </div>
+            </div>
+
+            {/* Subject scope: every document, graph and learning request uses this selection. */}
+            <div style={{ marginTop: 20, padding: 18, border: "2px solid #E8DDD5", borderRadius: 16, background: "#FFFCFA" }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 14, flexWrap: "wrap" }}>
+                <div>
+                  <h3 style={{ margin: 0, color: "#4A2818", fontSize: 21 }}>Subjects</h3>
+                  <p style={{ margin: "4px 0 0", color: "#77716D", fontSize: 15 }}>Choose the subject that owns these documents and its knowledge graph.</p>
+                </div>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <select value={selectedSubjectId} onChange={async (event) => {
+                    const next = event.target.value;
+                    setSelectedSubjectId(next);
+                    setSubjectId(next || null);
+                    setWorkspaceDocuments([]);
+                    if (!next) return;
+                    try {
+                      const { documents } = await listDocuments();
+                      setWorkspaceDocuments(mapWorkspaceDocuments(documents));
+                    } catch (err) {
+                      setLoadError(err instanceof Error ? err.message : "Could not load subject documents.");
+                    }
+                  }} style={{ minWidth: 150, padding: "8px 10px", borderRadius: 8, border: "1px solid #D8C8BD" }}>
+                    <option value="">Select subject</option>
+                    {subjects.map((subject) => <option key={subject.id} value={subject.id}>{subject.name} ({subject.document_count ?? 0})</option>)}
+                  </select>
+                </div>
               </div>
             </div>
 

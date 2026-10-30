@@ -1,5 +1,6 @@
 const TOKEN_KEY = "conceptscape.access_token";
 const WORKSPACE_KEY = "conceptscape.workspace_id";
+const SUBJECT_KEY = "conceptscape.subject_id";
 const LOGGED_OUT_KEY = "conceptscape.logged_out";
 
 export type AuthResponse = {
@@ -98,6 +99,17 @@ export function getWorkspaceId(): string | null {
   return window.localStorage.getItem(WORKSPACE_KEY);
 }
 
+export function getSubjectId(): string | null {
+  if (typeof window === "undefined") return null;
+  return window.localStorage.getItem(SUBJECT_KEY);
+}
+
+export function setSubjectId(id: string | null): void {
+  if (typeof window === "undefined") return;
+  if (id) window.localStorage.setItem(SUBJECT_KEY, id);
+  else window.localStorage.removeItem(SUBJECT_KEY);
+}
+
 export function setWorkspaceId(id: string): void {
   if (typeof window === "undefined") return;
   window.localStorage.setItem(WORKSPACE_KEY, id);
@@ -124,7 +136,9 @@ export function authHeaders(json = false): HeadersInit {
   if (json) headers["Content-Type"] = "application/json";
   const token = getToken();
   const workspace = getWorkspaceId();
+  const subject = getSubjectId();
   if (token) headers.Authorization = `Bearer ${token}`;
   if (workspace) headers["X-Workspace-ID"] = workspace;
+  if (subject) headers["X-Subject-ID"] = subject;
   return headers;
 }
