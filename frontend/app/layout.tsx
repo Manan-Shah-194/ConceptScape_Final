@@ -13,6 +13,11 @@ const jetbrainsMono = JetBrains_Mono({
 export const metadata = {
   title: "ConceptScape",
   description: "Evidence-grounded concept knowledge graph",
+  icons: {
+    icon: "/icon.png",
+    shortcut: "/icon.png",
+    apple: "/icon.png",
+  },
 };
 
 export const viewport = {
