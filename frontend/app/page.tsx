@@ -19,6 +19,7 @@ import {
 import { Navbar } from "@/components/Navbar";
 import { Footer } from "@/components/Footer";
 import { getHealth, type HealthStatus } from "@/lib/api";
+import { getToken } from "@/lib/auth";
 
 const FEATURES = [
   {
@@ -79,6 +80,11 @@ const PIPELINE = ["Ingest", "Clean", "Extract", "Normalize", "Relate", "Graph", 
 export default function LandingPage() {
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [backendUp, setBackendUp] = useState<boolean | null>(null);
+  const [signedIn, setSignedIn] = useState(false);
+
+  useEffect(() => {
+    setSignedIn(Boolean(getToken()));
+  }, []);
 
   useEffect(() => {
     getHealth()
@@ -138,10 +144,10 @@ export default function LandingPage() {
               Start a project
               <ArrowRight size={18} />
             </Link>
-            <Link href="/login" className="hero-cta-secondary" style={{ display: "inline-flex", alignItems: "center", gap: 7 }}>
+            {!signedIn && <Link href="/login" className="hero-cta-secondary" style={{ display: "inline-flex", alignItems: "center", gap: 7 }}>
               <LogIn size={17} />
               Log in to account
-            </Link>
+            </Link>}
             <Link href="/graph" className="hero-cta-secondary">
               <Network size={18} />
               Explore Graph
@@ -390,7 +396,7 @@ export default function LandingPage() {
             >
               Upload Documents <ArrowRight size={17} />
             </Link>
-            <Link
+            {!signedIn && <Link
               href="/login"
               style={{
                 display: "inline-flex",
@@ -417,7 +423,7 @@ export default function LandingPage() {
             >
               <LogIn size={16} />
               Already have an account? Log in
-            </Link>
+            </Link>}
           </div>
         </motion.div>
       </motion.section>
