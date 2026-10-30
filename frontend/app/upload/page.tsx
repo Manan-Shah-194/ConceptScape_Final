@@ -32,6 +32,7 @@ import {
   addYouTube,
   runPipeline,
   getStatus,
+  getWorkspaceStats,
   removeDocument,
   replaceDocument,
   reprocessDocument,
@@ -49,7 +50,7 @@ const PIPELINE_STAGES = [
   { id: 4, title: "4. Entity Resol.", sub: "Alias merging", detail: "Merging synonyms & computing embeddings similarity" },
   { id: 5, title: "5. Relation Extr.", sub: "Typed triples", detail: "Extracting prerequisites, dependencies & hierarchies" },
   { id: 6, title: "6. Graph Build", sub: "Dagre layout", detail: "Constructing DAG hierarchy & node coordinates" },
-  { id: 7, title: "7. Hybrid RAG", sub: "Vector + BM25", detail: "Syncing ChromaDB dense & BM25 sparse indices" },
+  { id: 7, title: "7. Hybrid RAG", sub: "Vector + BM25", detail: "Syncing Qdrant dense and keyword indices" },
 ];
 
 export default function UploadPage() {
@@ -61,23 +62,23 @@ export default function UploadPage() {
   const [error, setError] = useState("");
   const [youtubeUrl, setYoutubeUrl] = useState("");
   const [search, setSearch] = useState("");
-  const [preview, setPreview] = useState<{ name: string; url?: string } | null>(null);
+  const [preview, setPreview] = useState<{ name: string; url?: string; status?: string } | null>(null);
   const [subjects, setSubjects] = useState<Subject[]>([]);
   const [selectedSubjectId, setSelectedSubjectId] = useState("");
   const [hydrated, setHydrated] = useState(false);
   const [newSubjectName, setNewSubjectName] = useState("");
 
-  // Simulation state for interactive demonstration mode
+  // Live pipeline/artifact display state
   const [simulating, setSimulating] = useState(false);
   const [simStage, setSimStage] = useState<number | null>(null);
   const [simLog, setSimLog] = useState<string>(
-    "Ready. Drop documents or click 'Run Simulation' to demonstrate the 7-stage ingestion pipeline."
+    "Upload documents and run the pipeline to populate these live artifact metrics."
   );
-  const [simStats, setSimStats] = useState({ docs: 6, chunks: 42, concepts: 18, edges: 20 });
+  const [liveStats, setLiveStats] = useState({ docs: 0, chunks: 0, concepts: 0, edges: 0 });
 
   const refresh = useCallback(async () => {
     try {
-      const [d, s] = await Promise.all([listDocuments(), getStatus()]);
+      const [d, s, stats] = await Promise.all([listDocuments(), getStatus(), getWorkspaceStats()]);
       if (d && Array.isArray(d.documents)) {
         setDocs([...d.documents].sort((a, b) => {
           const pending = (value?: string) => value !== "processed" && value !== "error";
@@ -87,6 +88,15 @@ export default function UploadPage() {
         }));
       }
       setStatus(s);
+      setLiveStats({
+        docs: Number(stats?.documents || 0),
+        chunks: Number(stats?.chunks || 0),
+        concepts: Number(stats?.concepts || 0),
+        edges: Number(stats?.edges || 0),
+      });
+      if (s.running) setSimLog(`Pipeline is processing stage: ${s.current || "starting"}. Counts update from persisted artifacts.`);
+      else if (s.error) setSimLog(`Pipeline error: ${s.error}`);
+      else if (stats?.documents || stats?.chunks || stats?.concepts || stats?.edges) setSimLog("Live counts from the selected subject's persisted artifacts.");
     } catch {
       setError("Could not load documents or pipeline status. Check that the backend is running.");
     }
@@ -200,11 +210,12 @@ export default function UploadPage() {
   };
 
   const onPreview = async (name: string) => {
+    const document = docs.find((item) => item.filename === name);
     try {
       const url = await loadDocumentPreview(name);
-      setPreview({ name, url });
+      setPreview({ name, url, status: document?.status });
     } catch {
-      setPreview({ name });
+      setPreview({ name, status: document?.status });
     }
   };
 
@@ -782,10 +793,10 @@ export default function UploadPage() {
           }}
         >
           {[
-            { icon: FileText, val: simStats.docs, label: "SOURCE DOCS" },
-            { icon: Layers, val: simStats.chunks, label: "INDEXED CHUNKS" },
-            { icon: Network, val: simStats.concepts, label: "EXTRACTED CONCEPTS" },
-            { icon: Link2, val: simStats.edges, label: "KNOWLEDGE EDGES" },
+            { icon: FileText, val: liveStats.docs, label: "SOURCE DOCS" },
+            { icon: Layers, val: liveStats.chunks, label: "INDEXED CHUNKS" },
+            { icon: Network, val: liveStats.concepts, label: "EXTRACTED CONCEPTS" },
+            { icon: Link2, val: liveStats.edges, label: "KNOWLEDGE EDGES" },
           ].map((stat, i) => (
             <motion.div
               key={stat.label}
@@ -1226,52 +1237,29 @@ export default function UploadPage() {
                 )
               ) : (
                 <>
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10 }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 10 }}>
                     <div style={{ background: "#FAF7F4", padding: "10px 12px", borderRadius: 10, border: "1.5px solid #EAE4DE" }}>
                       <div style={{ fontSize: 15.8, color: "#77716D", fontWeight: 700, textTransform: "uppercase" }}>Status</div>
-                      <div style={{ fontSize: 19.5, fontWeight: 700, color: "#3D854B", marginTop: 2 }}>✓ Completed</div>
+                      <div style={{ fontSize: 19.5, fontWeight: 700, color: "#171514", marginTop: 2 }}>{preview.status || "unknown"}</div>
                     </div>
                     <div style={{ background: "#FAF7F4", padding: "10px 12px", borderRadius: 10, border: "1.5px solid #EAE4DE" }}>
-                      <div style={{ fontSize: 15.8, color: "#77716D", fontWeight: 700, textTransform: "uppercase" }}>Chunks</div>
-                      <div style={{ fontSize: 19.5, fontWeight: 700, color: "#171514", marginTop: 2 }}>7 indexed</div>
-                    </div>
-                    <div style={{ background: "#FAF7F4", padding: "10px 12px", borderRadius: 10, border: "1.5px solid #EAE4DE" }}>
-                      <div style={{ fontSize: 15.8, color: "#77716D", fontWeight: 700, textTransform: "uppercase" }}>Concepts</div>
-                      <div style={{ fontSize: 19.5, fontWeight: 700, color: "#171514", marginTop: 2 }}>3 extracted</div>
+                      <div style={{ fontSize: 15.8, color: "#77716D", fontWeight: 700, textTransform: "uppercase" }}>Pipeline data</div>
+                      <div style={{ fontSize: 17.5, fontWeight: 600, color: "#171514", marginTop: 2 }}>Available in the selected subject</div>
                     </div>
                   </div>
 
                   <div>
                     <label style={{ fontSize: 18, fontWeight: 700, color: "#171514", display: "block", marginBottom: 6 }}>
-                      Extracted Knowledge Entities
+                      Backend preview
                     </label>
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                      {["Gradient Descent", "Loss Surface", "Convexity", "Learning Rate", "Local Minima"].map((c) => (
-                        <span
-                          key={c}
-                          style={{
-                            padding: "4px 10px",
-                            borderRadius: 9999,
-                            background: "#FAF4EF",
-                            border: "1.5px solid #EAE4DE",
-                            fontSize: 17.2,
-                            fontWeight: 600,
-                            color: "#171514",
-                          }}
-                        >
-                          {c}
-                        </span>
-                      ))}
-                    </div>
+                    <p style={{ margin: 0, color: "#77716D", lineHeight: 1.5 }}>
+                      Concepts and chunks are shown only after the backend pipeline has produced them for this document.
+                    </p>
                   </div>
 
                   <div style={{ background: "#FAF7F4", border: "1.5px solid #EAE4DE", borderRadius: 10, padding: 12 }}>
-                    <div style={{ fontSize: 16.5, fontWeight: 700, color: "#77716D", textTransform: "uppercase", marginBottom: 4 }}>
-                      Sample OCR & Chunk Preview
-                    </div>
                     <p style={{ fontSize: 18, color: "#171514", margin: 0, lineHeight: 1.5, fontFamily: "var(--font-sans)" }}>
-                      "...Stochastic Gradient Descent computes iterative parameter updates using randomly sampled minibatches.
-                      Guaranteed convergence to local minima under Robbins-Monro learning rate schedule conditions..."
+                      Use the original document preview above for source content. No fabricated OCR or extracted entities are displayed.
                     </p>
                   </div>
                 </>

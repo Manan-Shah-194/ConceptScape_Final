@@ -225,7 +225,11 @@ export function Navbar({ rightSlot }: { rightSlot?: React.ReactNode }) {
 
                   <Link
                     href="/login"
-                    onClick={() => setShowUserMenu(false)}
+                    onClick={() => {
+                      clearSession();
+                      setSignedIn(false);
+                      setShowUserMenu(false);
+                    }}
                     style={{
                       display: "flex",
                       alignItems: "center",

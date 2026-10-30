@@ -1,4 +1,4 @@
-import { authHeaders, clearSession } from "./auth";
+import { authHeaders, clearSession, getSubjectId, setSubjectId, setWorkspaceId } from "./auth";
 import type { ConceptEdge, ConceptNode, GraphExport } from "./graph";
 
 export const API_BASE =
@@ -53,6 +53,23 @@ function failure(err: unknown, timeoutMs: number): ApiError {
   );
 }
 
+function isSubjectScopedCollectionRead(url: string): boolean {
+  const path = url.split("?", 1)[0];
+  return path.endsWith("/documents") || path.endsWith("/pipeline/status") || path.endsWith("/workspace/stats");
+}
+
+function isWorkspaceScopedCollectionRead(url: string): boolean {
+  const path = url.split("?", 1)[0];
+  return path.endsWith("/documents") || path.endsWith("/pipeline/status") ||
+    path.endsWith("/workspace/stats") || path.endsWith("/subjects");
+}
+
+function hasSubjectHeader(options?: RequestInit): boolean {
+  if (!options?.headers) return false;
+  const headers = new Headers(options.headers);
+  return headers.has("X-Subject-ID") && Boolean(headers.get("X-Subject-ID"));
+}
+
 /**
  * Read from the API.
  *
@@ -69,6 +86,33 @@ async function apiFetch<T>(
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, { ...options, signal: controller.signal });
+    if (res.status === 404 && isWorkspaceScopedCollectionRead(url)) {
+      // Account/workspace ids can briefly be stale while a tab switches
+      // accounts. First remove a stale subject, then recover the workspace
+      // from the authenticated user's own workspace list.
+      let retry = res;
+      if (isSubjectScopedCollectionRead(url) && hasSubjectHeader(options) && getSubjectId()) {
+        setSubjectId(null);
+        retry = await fetch(url, { ...options, headers: authHeaders(), signal: controller.signal });
+        if (retry.ok) return (await retry.json()) as T;
+      }
+      if (retry.status === 404) {
+        const workspaceResponse = await fetch(`${API_BASE}/workspaces`, {
+          headers: authHeaders(),
+          signal: controller.signal,
+        });
+        if (workspaceResponse.ok) {
+          const body = await workspaceResponse.json();
+          const firstWorkspace = body?.workspaces?.[0];
+          if (firstWorkspace?.id) {
+            setWorkspaceId(firstWorkspace.id);
+            setSubjectId(null);
+            retry = await fetch(url, { ...options, headers: authHeaders(), signal: controller.signal });
+            if (retry.ok) return (await retry.json()) as T;
+          }
+        }
+      }
+    }
     if (!res.ok) {
       handleUnauthorized(res);
       throw new ApiError(res.status, await describeFailure(res));
@@ -195,6 +239,22 @@ export type PipelineStatus = {
   stages: Stage[];
   elapsed: number;
 };
+
+export type WorkspaceStats = {
+  documents: number;
+  chunks: number;
+  concepts: number;
+  edges: number;
+};
+
+export async function getWorkspaceStats(workspaceId?: string): Promise<WorkspaceStats> {
+  const headers = new Headers(authHeaders());
+  if (workspaceId) {
+    headers.set("X-Workspace-ID", workspaceId);
+    headers.delete("X-Subject-ID");
+  }
+  return apiFetch(`${API_BASE}/workspace/stats`, { headers });
+}
 
 export async function listDocuments(): Promise<{ documents: Doc[] }> {
   return apiFetch(
@@ -358,27 +418,9 @@ export function documentPreviewUrl(filename: string): string {
 }
 
 export async function loadDocumentPreview(filename: string): Promise<string> {
-  try {
-    const r = await fetch(documentPreviewUrl(filename), { headers: authHeaders() });
-    if (r.ok) return URL.createObjectURL(await r.blob());
-  } catch {
-    // Fallback to inline SVG preview
-  }
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="600" height="400" viewBox="0 0 600 400">
-    <rect width="600" height="400" fill="#18181b" rx="12"/>
-    <rect x="20" y="20" width="560" height="360" fill="#27272a" rx="8" stroke="#3f3f46" stroke-width="1.5"/>
-    <text x="300" y="80" text-anchor="middle" fill="#7c5cfc" font-size="20" font-family="sans-serif" font-weight="bold">ConceptScape Document Inspector</text>
-    <text x="300" y="120" text-anchor="middle" fill="#e4e4e7" font-size="16" font-family="sans-serif">${filename}</text>
-    <line x1="60" y1="150" x2="540" y2="150" stroke="#52525b" stroke-width="1"/>
-    <text x="60" y="190" fill="#a1a1aa" font-size="14" font-family="sans-serif">• Optical Character Recognition (OCR): Completed</text>
-    <text x="60" y="225" fill="#a1a1aa" font-size="14" font-family="sans-serif">• Semantic Chunks Extracted: 8 chunks parsed</text>
-    <text x="60" y="260" fill="#a1a1aa" font-size="14" font-family="sans-serif">• Key Concepts: Gradient Descent, Learning Rate, Momentum</text>
-    <text x="60" y="295" fill="#a1a1aa" font-size="14" font-family="sans-serif">• Verified Citations: Grounded in source pages</text>
-    <rect x="230" y="330" width="140" height="30" rx="6" fill="#7c5cfc"/>
-    <text x="300" y="350" text-anchor="middle" fill="#ffffff" font-size="13" font-family="sans-serif" font-weight="600">Indexed & Active</text>
-  </svg>`;
-  const blob = new Blob([svg], { type: "image/svg+xml" });
-  return URL.createObjectURL(blob);
+  const r = await fetch(documentPreviewUrl(filename), { headers: authHeaders() });
+  if (!r.ok) throw new Error(`Could not load preview for ${filename}.`);
+  return URL.createObjectURL(await r.blob());
 }
 
 export async function getStatus(): Promise<PipelineStatus> {
@@ -496,6 +538,8 @@ export type Subject = { id: string; name: string; document_count?: number };
 
 export async function listSubjects(): Promise<Subject[]> {
   const response = await apiFetch<{ subjects: Subject[] }>(`${API_BASE}/subjects`, { headers: authHeaders() });
+  const saved = getSubjectId();
+  if (saved && !response.subjects.some((subject) => subject.id === saved)) setSubjectId(null);
   return response.subjects;
 }
 

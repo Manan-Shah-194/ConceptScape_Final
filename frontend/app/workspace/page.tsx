@@ -53,8 +53,16 @@ import { getToken, getUserProfile, getSubjectId, getWorkspaceId, initialsOf, set
 import {
   createWorkspace,
   deleteWorkspace,
+  getWorkspaceStats,
   getGraph,
   listDocuments,
+  uploadDocument,
+  addYouTube,
+  removeDocument,
+  replaceDocument,
+  reprocessDocument,
+  runPipeline,
+  getStatus,
   listMembers,
   listWorkspaces,
   addMember,
@@ -260,11 +268,7 @@ export default function WorkspaceSettingsPage() {
   // Documents Section State
   const [docSearch, setDocSearch] = useState("");
   const [youtubeInput, setYoutubeInput] = useState("");
-  const [docSimulating, setDocSimulating] = useState(false);
-  const [docSimStage, setDocSimStage] = useState<number | null>(null);
-  const [docSimStats, setDocSimStats] = useState({ docs: 6, chunks: 42, concepts: 18, edges: 20 });
-  const [docWorkingLog, setDocWorkingLog] = useState("Ready. Drop documents or click 'Run Simulation' to demonstrate the 7-stage ingestion pipeline.");
-  const [previewDoc, setPreviewDoc] = useState<{ name: string; size: string; version: string; type: string } | null>(null);
+  const [previewDoc, setPreviewDoc] = useState<{ name: string; size: string; version: string; type: string; status?: string } | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
 
   const [workspaceDocuments, setWorkspaceDocuments] = useState<Array<{
@@ -295,10 +299,9 @@ export default function WorkspaceSettingsPage() {
         const owner = { name: profile.fullName, email: profile.email };
         const serverWorkspaces = await listWorkspaces();
 
-        // Counts are scoped to the active workspace by the X-Workspace-ID
-        // header, so only the selected one can be measured without switching
-        // context. The rest show their own member count and dashes elsewhere.
-        const active = getWorkspaceId();
+        // Ask the API for each workspace explicitly. Reusing the current
+        // browser header here made an empty workspace inherit another
+        // workspace's document/concept counts.
         const built = await Promise.all(
           serverWorkspaces.map(async (ws) => {
             let docs = 0;
@@ -309,14 +312,11 @@ export default function WorkspaceSettingsPage() {
             } catch {
               // A workspace we cannot enumerate still lists with its own name.
             }
-            if (ws.id === active) {
-              try {
-                docs = (await listDocuments()).documents.length;
-              } catch { /* no documents yet */ }
-              try {
-                concepts = (await getGraph()).nodes.length;
-              } catch { /* graph not built yet */ }
-            }
+            try {
+              const stats = await getWorkspaceStats(ws.id);
+              docs = stats.documents;
+              concepts = stats.concepts;
+            } catch { /* a new workspace legitimately has zero artifacts */ }
             return toWorkspaceItem(ws, { docs, concepts, members }, owner);
           })
         );
@@ -325,6 +325,7 @@ export default function WorkspaceSettingsPage() {
         setWorkspaces(built);
         if (built.length && !built.some((w) => w.id === selectedId)) {
           setSelectedId(built[0].id);
+          setWorkspaceId(built[0].id);
         }
       } catch (err) {
         if (cancelled) return;
@@ -344,7 +345,7 @@ export default function WorkspaceSettingsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Documents actually present in this workspace.
+  // Documents actually present in this workspace/subject.
   useEffect(() => {
     if (!selectedId) return;
     let cancelled = false;
@@ -362,14 +363,14 @@ export default function WorkspaceSettingsPage() {
     };
   }, [selectedId, selectedSubjectId]);
 
-  // Keep the overview cards in the same subject scope as the Documents tab.
+  // Keep overview cards in the same workspace/subject scope as Documents.
   useEffect(() => {
-    if (!selectedId || !selectedSubjectId) return;
+    if (!selectedId) return;
     let cancelled = false;
-    Promise.all([listDocuments(), getGraph()]).then(([documents, graph]) => {
+    getWorkspaceStats().then((stats) => {
       if (cancelled) return;
       setWorkspaces((previous) => previous.map((workspace) => workspace.id === selectedId
-        ? { ...workspace, docs: documents.documents.length, concepts: graph.nodes.length }
+        ? { ...workspace, docs: stats.documents, concepts: stats.concepts }
         : workspace));
     }).catch(() => {
       // The document effect below owns the visible error state.
@@ -610,120 +611,41 @@ export default function WorkspaceSettingsPage() {
     return { all: workspaceDocuments.length, uploaded, shared };
   }, [workspaceDocuments]);
 
-  const PIPELINE_STAGES = [
-    { id: 1, title: "1. Ingest & OCR", sub: "PDF/PPTX parsing", detail: "PaddleOCR bilingual extraction with angle recovery" },
-    { id: 2, title: "2. Clean & Chunk", sub: "Token overlap", detail: "512-token overlap window normalization" },
-    { id: 3, title: "3. Concept Extr.", sub: "LLM extraction", detail: "Gemini 3.6 Flash candidate concept taxonomy" },
-    { id: 4, title: "4. Entity Resol.", sub: "Alias merging", detail: "Fuzzy cosine alignment & entity deduplication" },
-    { id: 5, title: "5. Relation Extr.", sub: "Typed triples", detail: "Directed dependency triples (requires, produces)" },
-    { id: 6, title: "6. Graph Build", sub: "Dagre layout", detail: "Radial Dagre coordinate topology layout" },
-    { id: 7, title: "7. Hybrid RAG", sub: "Vector + BM25", detail: "BM25 keyword + dense vector hybrid index" },
-  ];
-
-  const triggerPipelineSimulation = (targetDocName?: string) => {
-    if (docSimulating) return;
-    setDocSimulating(true);
-    setDocSimStage(0);
-    setDocSimStats({ docs: workspaceDocuments.length, chunks: 8, concepts: 2, edges: 0 });
-    setDocWorkingLog(
-      targetDocName
-        ? `Stage 1/7: Ingesting '${targetDocName}' via PaddleOCR bilingual engine...`
-        : "Stage 1/7: Ingesting 6 documents & running PaddleOCR text extraction..."
-    );
-
-    const STAGES_TIMELINE = [
-      {
-        stage: 1,
-        log: "Stage 2/7: Cleaning text & generating 42 chunks with 512-token overlap...",
-        stats: { docs: workspaceDocuments.length, chunks: 42, concepts: 6, edges: 4 },
-      },
-      {
-        stage: 2,
-        log: "Stage 3/7: Gemini 3.6 Flash & LLaMA 3.3 extracting candidate concepts & formal definitions...",
-        stats: { docs: workspaceDocuments.length, chunks: 42, concepts: 14, edges: 8 },
-      },
-      {
-        stage: 3,
-        log: "Stage 4/7: Normalizing entity aliases: Merged 'SGD' ↔ 'Stochastic Gradient Descent' (0.98 similarity)...",
-        stats: { docs: workspaceDocuments.length, chunks: 42, concepts: 18, edges: 12 },
-      },
-      {
-        stage: 4,
-        log: "Stage 5/7: Extracting 20 directed relationships (requires, used_for, part_of, produces)...",
-        stats: { docs: workspaceDocuments.length, chunks: 42, concepts: 18, edges: 20 },
-      },
-      {
-        stage: 5,
-        log: "Stage 6/7: Constructing knowledge graph topology in Dagre radial coordinate space...",
-        stats: { docs: workspaceDocuments.length, chunks: 42, concepts: 18, edges: 20 },
-      },
-      {
-        stage: 6,
-        log: "Stage 7/7: Indexing BM25 + Dense vector embeddings for Grounded Hybrid RAG...",
-        stats: { docs: workspaceDocuments.length, chunks: 42, concepts: 18, edges: 20 },
-      },
-    ];
-
-    STAGES_TIMELINE.forEach((step, idx) => {
-      setTimeout(() => {
-        setDocSimStage(step.stage);
-        setDocWorkingLog(step.log);
-        setDocSimStats(step.stats);
-
-        if (idx === STAGES_TIMELINE.length - 1) {
-          setTimeout(() => {
-            setDocSimulating(false);
-            setDocSimStage(7); // all 7 stages completed
-            setDocWorkingLog("✓ Ingestion pipeline completed successfully! 18 concepts and 20 edges indexed.");
-          }, 1300);
-        }
-      }, (idx + 1) * 1150);
-    });
-  };
-
-  const handleAddYouTube = () => {
+  const handleAddYouTube = async () => {
     if (!youtubeInput.trim()) return;
-    const cleanUrl = youtubeInput.trim();
-    const newDoc = {
-      id: `doc-${Date.now()}`,
-      name: cleanUrl.includes("v=") ? `yt_video_${cleanUrl.split("v=")[1].slice(0, 8)}.yt` : "lecture_video.yt",
-      type: "yt",
-      version: "v1",
-      size: "Video stream",
-      status: "completed",
-      origin: "uploaded" as const,
-      uploadedBy: "You",
-      date: "Just now",
-    };
-    setWorkspaceDocuments((prev) => [newDoc, ...prev]);
-    setYoutubeInput("");
+    try {
+      await addYouTube(youtubeInput.trim());
+      setYoutubeInput("");
+      await reloadWorkspaceDocuments();
+    } catch (err: any) { setLoadError(err?.message || "Could not add the YouTube video."); }
   };
 
-  const handleFileUpload = (files: FileList | null) => {
+  const reloadWorkspaceDocuments = async () => {
+    const { documents } = await listDocuments();
+    setWorkspaceDocuments(mapWorkspaceDocuments(documents));
+  };
+
+  const handleFileUpload = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
-    const uploadedDocs = Array.from(files).map((f) => {
-      const ext = f.name.split(".").pop()?.toLowerCase() || "pdf";
-      return {
-        id: `doc-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
-        name: f.name,
-        type: ext,
-        version: "v1",
-        size: `${Math.round(f.size / 1024)} KB`,
-        status: "completed",
-        origin: "uploaded" as const,
-        uploadedBy: "You",
-        date: "Just now",
-      };
-    });
-    setWorkspaceDocuments((prev) => [...uploadedDocs, ...prev]);
+    try {
+      for (const file of Array.from(files)) await uploadDocument(file);
+      await reloadWorkspaceDocuments();
+    } catch (err: any) { setLoadError(err?.message || "Could not upload the document."); }
   };
 
-  const handleDeleteDocument = (id: string) => {
-    setWorkspaceDocuments((prev) => prev.filter((d) => d.id !== id));
+  const handleDeleteDocument = async (name: string) => {
+    try {
+      await removeDocument(name);
+      await reloadWorkspaceDocuments();
+    } catch (err: any) { setLoadError(err?.message || "Could not delete the document."); }
   };
 
-  const handleReprocessDocument = (name: string) => {
-    triggerPipelineSimulation(name);
+  const handleReprocessDocument = async (name: string) => {
+    try {
+      await reprocessDocument(name);
+      await runPipeline();
+      await reloadWorkspaceDocuments();
+    } catch (err: any) { setLoadError(err?.message || "Could not reprocess the document."); }
   };
 
   const renderDocTypeIcon = (type: string) => {
@@ -1025,6 +947,10 @@ export default function WorkspaceSettingsPage() {
                     key={ws.id}
                     onClick={() => {
                       setSelectedId(ws.id);
+                      setWorkspaceId(ws.id);
+                      setSubjectId(null);
+                      setSelectedSubjectId("");
+                      setWorkspaceDocuments([]);
                       setIsEditingDetails(false);
                     }}
                     style={{
@@ -2935,27 +2861,16 @@ export default function WorkspaceSettingsPage() {
                                 onChange={(e) => {
                                   const f = e.target.files?.[0];
                                   if (f) {
-                                    setWorkspaceDocuments((prev) =>
-                                      prev.map((item) =>
-                                        item.id === doc.id
-                                          ? {
-                                              ...item,
-                                              name: f.name,
-                                              size: `${Math.round(f.size / 1024)} KB`,
-                                              origin: "uploaded",
-                                              uploadedBy: "You",
-                                              date: "Just now",
-                                            }
-                                          : item
-                                      )
-                                    );
+                                    replaceDocument(doc.name, f)
+                                      .then(reloadWorkspaceDocuments)
+                                      .catch((err: any) => setLoadError(err?.message || "Could not replace the document."));
                                   }
                                 }}
                               />
                             </label>
 
                             <button
-                              onClick={() => handleDeleteDocument(doc.id)}
+                              onClick={() => handleDeleteDocument(doc.name)}
                               title="Remove document"
                               style={{
                                 width: 30,
@@ -3433,52 +3348,33 @@ export default function WorkspaceSettingsPage() {
 
             {/* Body */}
             <div style={{ padding: 22, display: "flex", flexDirection: "column", gap: 14 }}>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 10 }}>
                 <div style={{ background: "#FAF7F4", padding: "10px 12px", borderRadius: 10, border: "1.5px solid #EAE4DE" }}>
                   <div style={{ fontSize: 15.8, color: "#77716D", fontWeight: 700, textTransform: "uppercase" }}>Status</div>
-                  <div style={{ fontSize: 19.5, fontWeight: 700, color: "#3D854B", marginTop: 2 }}>✓ Completed</div>
+                  <div style={{ fontSize: 19.5, fontWeight: 700, color: "#171514", marginTop: 2 }}>
+                    {previewDoc.status || "unknown"}
+                  </div>
                 </div>
                 <div style={{ background: "#FAF7F4", padding: "10px 12px", borderRadius: 10, border: "1.5px solid #EAE4DE" }}>
-                  <div style={{ fontSize: 15.8, color: "#77716D", fontWeight: 700, textTransform: "uppercase" }}>Chunks</div>
-                  <div style={{ fontSize: 19.5, fontWeight: 700, color: "#171514", marginTop: 2 }}>7 indexed</div>
-                </div>
-                <div style={{ background: "#FAF7F4", padding: "10px 12px", borderRadius: 10, border: "1.5px solid #EAE4DE" }}>
-                  <div style={{ fontSize: 15.8, color: "#77716D", fontWeight: 700, textTransform: "uppercase" }}>Concepts</div>
-                  <div style={{ fontSize: 19.5, fontWeight: 700, color: "#171514", marginTop: 2 }}>3 extracted</div>
+                  <div style={{ fontSize: 15.8, color: "#77716D", fontWeight: 700, textTransform: "uppercase" }}>Version and size</div>
+                  <div style={{ fontSize: 19.5, fontWeight: 700, color: "#171514", marginTop: 2 }}>
+                    {previewDoc.version} • {previewDoc.size}
+                  </div>
                 </div>
               </div>
 
               <div>
                 <label style={{ fontSize: 18, fontWeight: 700, color: "#171514", display: "block", marginBottom: 6 }}>
-                  Extracted Knowledge Entities
+                  Backend preview
                 </label>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                  {["Gradient Descent", "Loss Surface", "Convexity", "Learning Rate", "Local Minima"].map((c) => (
-                    <span
-                      key={c}
-                      style={{
-                        padding: "4px 10px",
-                        borderRadius: 9999,
-                        background: "#FAF4EF",
-                        border: "1.5px solid #EAE4DE",
-                        fontSize: 17.2,
-                        fontWeight: 600,
-                        color: "#171514",
-                      }}
-                    >
-                      {c}
-                    </span>
-                  ))}
-                </div>
+                <p style={{ margin: 0, color: "#77716D", lineHeight: 1.5 }}>
+                  This document is shown from the active workspace. Concepts and chunks are displayed only after the backend pipeline has produced them.
+                </p>
               </div>
 
               <div style={{ background: "#FAF7F4", border: "1.5px solid #EAE4DE", borderRadius: 10, padding: 12 }}>
-                <div style={{ fontSize: 16.5, fontWeight: 700, color: "#77716D", textTransform: "uppercase", marginBottom: 4 }}>
-                  Sample OCR & Chunk Preview
-                </div>
                 <p style={{ fontSize: 18, color: "#171514", margin: 0, lineHeight: 1.5, fontFamily: "var(--font-sans)" }}>
-                  "...Stochastic Gradient Descent computes iterative parameter updates using randomly sampled minibatches.
-                  Guaranteed convergence to local minima under Robbins-Monro learning rate schedule conditions..."
+                  Use the document preview action to open the original file. No fabricated OCR, chunk, or concept data is shown here.
                 </p>
               </div>
             </div>

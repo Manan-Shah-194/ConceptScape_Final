@@ -473,13 +473,37 @@ _pipeline_errors: dict[str, str] = {}
 _pipeline_loaded_at: dict[str, float] = {}
 
 
-def get_pipeline(workspace_id: str):
-    if workspace_id not in _pipelines and workspace_id not in _pipeline_errors:
+def _pipeline_scope(scope_id: str) -> tuple[str, str | None, dict[str, Path], str]:
+    """Resolve a workspace or workspace::subject scope to isolated artifacts."""
+    if "::" in scope_id:
+        workspace_id, subject_id = scope_id.split("::", 1)
+        paths = ensure_subject_paths(workspace_id, subject_id)
+        collection = f"workspace_{workspace_id}_subject_{subject_id}"
+        return workspace_id, subject_id, paths, collection
+    paths = ensure_workspace_paths(scope_id)
+    return scope_id, None, paths, f"workspace_{scope_id}"
+
+
+def get_pipeline(scope_id: str):
+    if scope_id not in _pipelines and scope_id not in _pipeline_errors:
+        _, subject_id, paths, collection = _pipeline_scope(scope_id)
+        required_artifacts = [
+            paths["data"] / "normalized_concepts.json",
+            paths["data"] / "relationships.json",
+            paths["output"] / "preprocessed_chunks.json",
+        ]
+        missing_artifacts = [path.name for path in required_artifacts if not path.is_file()]
+        if missing_artifacts:
+            scope_label = "this subject" if subject_id else "this workspace"
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"The pipeline for {scope_label} is incomplete ({', '.join(missing_artifacts)} missing). "
+                "Run the pipeline before asking a grounded question.",
+            )
         try:
             from rag.pipeline import RAGPipeline
             from config import settings
             logging.info("Initialising RAG pipeline (first request warms the embedding model)…")
-            paths = ensure_workspace_paths(workspace_id)
             previous_paths = (settings.output_dir, settings.data_dir, settings.qdrant_path,
                               settings.qdrant_collection_prefix)
             with SETTINGS_LOCK:
@@ -487,19 +511,22 @@ def get_pipeline(workspace_id: str):
                     settings.output_dir = str(paths["output"])
                     settings.data_dir = str(paths["data"])
                     settings.qdrant_path = str(paths["vectors"])
-                    settings.qdrant_collection_prefix = f"workspace_{workspace_id}"
-                    _pipelines[workspace_id] = RAGPipeline()
-                    _pipeline_loaded_at[workspace_id] = time.time()
+                    settings.qdrant_collection_prefix = collection
+                    _pipelines[scope_id] = RAGPipeline()
+                    _pipeline_loaded_at[scope_id] = time.time()
                 finally:
                     (settings.output_dir, settings.data_dir, settings.qdrant_path,
                      settings.qdrant_collection_prefix) = previous_paths
             logging.info("RAG pipeline ready")
         except Exception as e:
-            _pipeline_errors[workspace_id] = str(e)
+            _pipeline_errors[scope_id] = str(e)
             logging.error(f"Could not initialise RAG pipeline: {e}")
-    if workspace_id not in _pipelines:
-        raise HTTPException(503, "RAG pipeline unavailable. Check the pipeline status and provider configuration.")
-    return _pipelines[workspace_id]
+    if scope_id not in _pipelines:
+        detail = _pipeline_errors.get(scope_id)
+        raise HTTPException(503, "Grounded RAG is unavailable for the active workspace/subject. "
+                            "Check the pipeline status and provider configuration." +
+                            (f" Details: {detail[:180]}" if detail else ""))
+    return _pipelines[scope_id]
 
 
 def _load(path: str) -> Dict[str, Any]:
@@ -558,9 +585,15 @@ def health() -> Dict[str, Any]:
 def graph(document: str | None = Query(default=None), relation_type: str | None = Query(default=None),
           min_confidence: float = Query(default=0.0, ge=0.0, le=1.0), connected_only: bool = False,
           source: str | None = Query(default=None), x_subject_id: str | None = Header(default=None), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
-    data = _graph_data(workspace, x_subject_id)
     if x_subject_id:
         subject_for_workspace(x_subject_id, workspace, db)
+    try:
+        data = _learning_graph(workspace, x_subject_id, db)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_404_NOT_FOUND:
+            return {"nodes": [], "edges": []}
+        raise
+    if x_subject_id:
         subject_files = {item.filename for item in db.query(DocumentRecord).filter_by(workspace_id=workspace.id, subject_id=x_subject_id).all()}
         data["nodes"] = [node for node in data.get("nodes", []) if subject_files.intersection(node.get("filenames", []))]
         node_ids = {node.get("concept_id") for node in data["nodes"]}
@@ -584,17 +617,151 @@ def graph(document: str | None = Query(default=None), relation_type: str | None 
     return {"nodes": nodes, "edges": edges}
 
 
+@app.get("/workspace/stats")
+def workspace_stats(x_subject_id: str | None = Header(default=None),
+                    workspace: Workspace = Depends(current_workspace),
+                    db: Session = Depends(get_db)) -> Dict[str, int]:
+    """Return live artifact counts for the current workspace or subject.
+
+    These values are read from the persisted document records and graph/chunk
+    artifacts; no demo or simulation totals are used by the upload UI.
+    """
+    if x_subject_id:
+        # A browser tab can retain a subject id while the user signs into a
+        # different account. The workspace header is already authenticated,
+        # so do not turn that stale subject into a 404 for the stats poll.
+        subject = db.query(Subject).filter_by(id=x_subject_id, workspace_id=workspace.id).first()
+        if subject is not None:
+            paths = ensure_subject_paths(workspace.id, x_subject_id)
+            _materialize_subject_artifacts(workspace, x_subject_id, db)
+            document_query = db.query(DocumentRecord).filter_by(
+                workspace_id=workspace.id, subject_id=x_subject_id
+            )
+        else:
+            x_subject_id = None
+            paths = ensure_workspace_paths(workspace.id)
+            document_query = db.query(DocumentRecord).filter_by(workspace_id=workspace.id)
+    else:
+        paths = ensure_workspace_paths(workspace.id)
+        document_query = db.query(DocumentRecord).filter_by(workspace_id=workspace.id)
+
+    chunks = 0
+    chunk_file = paths["output"] / "preprocessed_chunks.json"
+    if chunk_file.is_file():
+        try:
+            payload = _load(str(chunk_file))
+            if isinstance(payload, list):
+                chunks = len(payload)
+            elif isinstance(payload, dict) and isinstance(payload.get("chunks"), list):
+                chunks = len(payload["chunks"])
+        except (OSError, ValueError, TypeError):
+            logging.warning("Could not read chunk artifact for workspace stats", exc_info=True)
+
+    try:
+        graph_data = _learning_graph(workspace, x_subject_id, db)
+    except HTTPException as exc:
+        # A new account/workspace may not have run the pipeline yet. Stats are
+        # still valid in that state: documents/chunks can be counted while the
+        # graph counters remain zero instead of turning the polling endpoint
+        # into a misleading 404.
+        if exc.status_code != status.HTTP_404_NOT_FOUND:
+            raise
+        graph_data = {"nodes": [], "edges": []}
+    return {
+        "documents": document_query.count(),
+        "chunks": chunks,
+        "concepts": len(graph_data.get("nodes", [])),
+        "edges": len(graph_data.get("edges", [])),
+    }
+
+
+def _materialize_subject_artifacts(workspace: Workspace, subject_id: str, db: Session) -> None:
+    """Create an isolated subject view from already processed workspace artifacts.
+
+    This is an offline migration for documents processed before subject-scoped
+    pipeline folders existed. It only filters existing provenance by the
+    document-to-subject mapping; it never calls an LLM or invents concepts.
+    New documents still require the normal subject pipeline run.
+    """
+    subject_paths = ensure_subject_paths(workspace.id, subject_id)
+    graph_path = subject_paths["data"] / "graph_export.json"
+    if graph_path.is_file():
+        return
+    subject_files = {
+        item.filename for item in db.query(DocumentRecord)
+        .filter_by(workspace_id=workspace.id, subject_id=subject_id).all()
+    }
+    if not subject_files:
+        return
+    source_paths = ensure_workspace_paths(workspace.id)
+    source_concepts_path = source_paths["data"] / "normalized_concepts.json"
+    source_relationships_path = source_paths["data"] / "relationships.json"
+    source_chunks_path = source_paths["output"] / "preprocessed_chunks.json"
+    source_graph_path = source_paths["data"] / "graph_export.json"
+    if not all(path.is_file() for path in (source_concepts_path, source_relationships_path, source_chunks_path, source_graph_path)):
+        return
+
+    with source_concepts_path.open(encoding="utf-8") as handle:
+        concepts_payload = json.load(handle)
+    concepts = [item for item in concepts_payload.get("concepts", [])
+                if subject_files.intersection(item.get("filenames", []))]
+    concept_ids = {item.get("concept_id") for item in concepts}
+
+    with source_relationships_path.open(encoding="utf-8") as handle:
+        relationships_payload = json.load(handle)
+    relationships = [item for item in relationships_payload.get("relationships", [])
+                     if item.get("source_concept_id") in concept_ids
+                     and item.get("target_concept_id") in concept_ids]
+
+    with source_chunks_path.open(encoding="utf-8") as handle:
+        chunks_payload = json.load(handle)
+    chunks = [item for item in chunks_payload.get("chunks", [])
+              if item.get("filename") in subject_files]
+
+    with source_graph_path.open(encoding="utf-8") as handle:
+        graph_payload = json.load(handle)
+    nodes = [item for item in graph_payload.get("nodes", []) if item.get("concept_id") in concept_ids]
+    edges = [item for item in graph_payload.get("edges", [])
+             if item.get("source_concept_id") in concept_ids
+             and item.get("target_concept_id") in concept_ids]
+
+    subject_paths["data"].mkdir(parents=True, exist_ok=True)
+    subject_paths["output"].mkdir(parents=True, exist_ok=True)
+    (subject_paths["data"] / "normalized_concepts.json").write_text(
+        json.dumps({**concepts_payload, "subject_id": subject_id, "concepts": concepts}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (subject_paths["data"] / "relationships.json").write_text(
+        json.dumps({**relationships_payload, "subject_id": subject_id, "relationships": relationships}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (subject_paths["output"] / "preprocessed_chunks.json").write_text(
+        json.dumps({**chunks_payload, "subject_id": subject_id, "chunks": chunks}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    graph_path.write_text(json.dumps({"nodes": nodes, "edges": edges}, ensure_ascii=False), encoding="utf-8")
+    logging.info("Materialized %s subject artifacts for %d mapped documents", subject_id, len(subject_files))
+
+
 def _graph_data(workspace: Workspace, subject_id: str | None = None) -> Dict[str, Any]:
     if subject_id:
         subject_graph = ensure_subject_paths(workspace.id, subject_id)["data"] / "graph_export.json"
-        if subject_graph.is_file():
-            return _load(str(subject_graph))
+        return _load(str(subject_graph))
     return _load(str(ensure_workspace_paths(workspace.id)["data"] / "graph_export.json"))
 
 
 @app.get("/graph/neighbors/{concept_id}")
-def graph_neighbors(concept_id: str, hops: int = Query(default=1, ge=1, le=5), workspace: Workspace = Depends(current_workspace)) -> Dict[str, Any]:
-    data = _graph_data(workspace)
+def graph_neighbors(concept_id: str, hops: int = Query(default=1, ge=1, le=5),
+                    x_subject_id: str | None = Header(default=None), workspace: Workspace = Depends(current_workspace),
+                    db: Session = Depends(get_db)) -> Dict[str, Any]:
+    if x_subject_id:
+        subject_for_workspace(x_subject_id, workspace, db)
+    try:
+        data = _learning_graph(workspace, x_subject_id, db)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_404_NOT_FOUND:
+            return {"nodes": [], "edges": []}
+        raise
     keep = {concept_id}
     for _ in range(hops):
         keep |= {e["target_concept_id"] for e in data.get("edges", []) if e.get("source_concept_id") in keep}
@@ -604,8 +771,17 @@ def graph_neighbors(concept_id: str, hops: int = Query(default=1, ge=1, le=5), w
 
 
 @app.get("/graph/paths")
-def graph_paths(source_id: str, target_id: str, max_hops: int = Query(default=4, ge=1, le=8), workspace: Workspace = Depends(current_workspace)) -> Dict[str, Any]:
-    data = _graph_data(workspace)
+def graph_paths(source_id: str, target_id: str, max_hops: int = Query(default=4, ge=1, le=8),
+                x_subject_id: str | None = Header(default=None), workspace: Workspace = Depends(current_workspace),
+                db: Session = Depends(get_db)) -> Dict[str, Any]:
+    if x_subject_id:
+        subject_for_workspace(x_subject_id, workspace, db)
+    try:
+        data = _learning_graph(workspace, x_subject_id, db)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_404_NOT_FOUND:
+            return {"paths": []}
+        raise
     adjacency: dict[str, list[tuple[str, dict]]] = {}
     for edge in data.get("edges", []):
         adjacency.setdefault(edge["source_concept_id"], []).append((edge["target_concept_id"], edge))
@@ -626,8 +802,16 @@ def graph_paths(source_id: str, target_id: str, max_hops: int = Query(default=4,
 
 
 @app.get("/graph/prerequisites/{concept_id}")
-def graph_prerequisites(concept_id: str, workspace: Workspace = Depends(current_workspace)) -> Dict[str, Any]:
-    data = _graph_data(workspace)
+def graph_prerequisites(concept_id: str, x_subject_id: str | None = Header(default=None),
+                        workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    if x_subject_id:
+        subject_for_workspace(x_subject_id, workspace, db)
+    try:
+        data = _learning_graph(workspace, x_subject_id, db)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_404_NOT_FOUND:
+            return {"nodes": [], "edges": []}
+        raise
     keep = {concept_id}
     changed = True
     while changed:
@@ -641,9 +825,11 @@ def graph_prerequisites(concept_id: str, workspace: Workspace = Depends(current_
 
 
 def _learning_graph(workspace: Workspace, subject_id: str | None = None, db: Session | None = None) -> Dict[str, Any]:
-    data = _graph_data(workspace, subject_id)
     if subject_id and db is not None:
         subject_for_workspace(subject_id, workspace, db)
+        _materialize_subject_artifacts(workspace, subject_id, db)
+    data = _graph_data(workspace, subject_id)
+    if subject_id and db is not None:
         subject_files = {item.filename for item in db.query(DocumentRecord).filter_by(workspace_id=workspace.id, subject_id=subject_id).all()}
         data["nodes"] = [node for node in data.get("nodes", []) if subject_files.intersection(node.get("filenames", []))]
         node_ids = {node.get("concept_id") for node in data["nodes"]}
@@ -693,7 +879,8 @@ def explain(req: ExplainRequest, x_subject_id: str | None = Header(default=None)
         "source evidence supports one. Use several well-structured paragraphs and only the retrieved evidence; "
         "do not invent facts. Concept: " + concept["canonical_name"]
     )
-    answer = get_pipeline(workspace.id).ask(prompt).to_dict()
+    scope_id = f"{workspace.id}::{x_subject_id}" if x_subject_id else workspace.id
+    answer = get_pipeline(scope_id).ask(prompt).to_dict()
     session = db.query(ChatSession).filter_by(id=req.session_id, workspace_id=workspace.id).first() if req.session_id else None
     if session is None:
         session = ChatSession(workspace_id=workspace.id, title=f"Explain: {concept['canonical_name']}")
@@ -811,7 +998,13 @@ def progress_dashboard(x_subject_id: str | None = Header(default=None), user: Us
     items = db.query(ConceptProgress).filter_by(workspace_id=workspace.id, user_id=user.id).all()
     paths = db.query(LearningPathProgress).filter_by(workspace_id=workspace.id, user_id=user.id).all()
     attempts = db.query(QuizAttempt).filter_by(workspace_id=workspace.id, user_id=user.id).all()
-    graph_nodes = {node["concept_id"]: node for node in _learning_graph(workspace, x_subject_id, db).get("nodes", [])}
+    try:
+        graph_payload = _learning_graph(workspace, x_subject_id, db)
+    except HTTPException as exc:
+        if exc.status_code != status.HTTP_404_NOT_FOUND:
+            raise
+        graph_payload = {"nodes": [], "edges": []}
+    graph_nodes = {node["concept_id"]: node for node in graph_payload.get("nodes", [])}
     # A subject scope must apply to learning state as well as graph data.
     # Otherwise progress rows from another subject leak into the selected view.
     items = [item for item in items if item.concept_id in graph_nodes]
@@ -963,28 +1156,37 @@ def _invalidate_pipeline(workspace_id: str) -> None:
 _runners: dict[str, PipelineRunner] = {}
 
 
-def _finish_latest_job(workspace_id: str) -> None:
-    runner = _runners.get(workspace_id)
+def _finish_latest_job(scope_id: str) -> None:
+    workspace_id, subject_id, _, _ = _pipeline_scope(scope_id)
+    runner = _runners.get(scope_id)
     state = runner.state if runner else {}
     db = SessionLocal()
     try:
-        job = (db.query(PipelineJob)
+        query = (db.query(PipelineJob)
                .filter(PipelineJob.workspace_id == workspace_id,
+                       PipelineJob.subject_id == subject_id,
                        PipelineJob.status.in_(["queued", "running"]))
                .order_by(PipelineJob.created_at.desc()).first())
+        job = query
         if job:
             job.status = "failed" if state.get("error") else "completed"
             job.current = state.get("current")
             job.error = state.get("error")
             job.finished_at = datetime.now(timezone.utc)
             if job.status == "completed":
-                db.query(DocumentRecord).filter_by(workspace_id=workspace_id).update(
+                document_query = db.query(DocumentRecord).filter_by(workspace_id=workspace_id, subject_id=subject_id)
+                if subject_id is None:
+                    document_query = db.query(DocumentRecord).filter_by(workspace_id=workspace_id)
+                document_query.update(
                     {DocumentRecord.status: "processed", DocumentRecord.error: None,
                      DocumentRecord.processed_at: datetime.now(timezone.utc)},
                     synchronize_session=False,
                 )
             else:
-                db.query(DocumentRecord).filter_by(workspace_id=workspace_id, status="queued").update(
+                document_query = db.query(DocumentRecord).filter_by(workspace_id=workspace_id, status="queued", subject_id=subject_id)
+                if subject_id is None:
+                    document_query = db.query(DocumentRecord).filter_by(workspace_id=workspace_id, status="queued")
+                document_query.update(
                     {DocumentRecord.status: "error", DocumentRecord.error: job.error},
                     synchronize_session=False,
                 )
@@ -996,7 +1198,7 @@ def _finish_latest_job(workspace_id: str) -> None:
 def get_runner(workspace_id: str) -> PipelineRunner:
     runner = _runners.get(workspace_id)
     if runner is None:
-        runner = PipelineRunner(on_complete=lambda wid: (_invalidate_pipeline(wid), _finish_latest_job(wid.split("::", 1)[0])))
+        runner = PipelineRunner(on_complete=lambda wid: (_invalidate_pipeline(wid), _finish_latest_job(wid)))
         _runners[workspace_id] = runner
     return runner
 
@@ -1007,7 +1209,8 @@ def documents(q: str = "", status_filter: str | None = None, x_subject_id: str |
     if not d.is_dir():
         return {"documents": []}
     if x_subject_id:
-        subject_for_workspace(x_subject_id, workspace, db)
+        if db.query(Subject).filter_by(id=x_subject_id, workspace_id=workspace.id).first() is None:
+            return {"documents": [], "total": 0}
     records = {record.filename: record for record in db.query(DocumentRecord).filter_by(workspace_id=workspace.id).all()
                if not x_subject_id or record.subject_id == x_subject_id}
     items = []
@@ -1260,7 +1463,7 @@ def pipeline_run(x_subject_id: str | None = Header(default=None), user: User = D
             if source.is_file():
                 shutil.copy2(source, subject_paths["documents"] / record.filename)
         scope_id = f"{workspace.id}::{subject.id}"
-    job = PipelineJob(workspace_id=workspace.id, status="queued", started_at=datetime.now(timezone.utc))
+    job = PipelineJob(workspace_id=workspace.id, subject_id=x_subject_id, status="queued", started_at=datetime.now(timezone.utc))
     db.add(job)
     db.flush()
     _metrics["pipeline_jobs_total"] += 1
@@ -1285,27 +1488,32 @@ def pipeline_run(x_subject_id: str | None = Header(default=None), user: User = D
 @app.get("/pipeline/status")
 def pipeline_status(x_subject_id: str | None = Header(default=None), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
     if x_subject_id:
-        subject_for_workspace(x_subject_id, workspace, db)
+        if db.query(Subject).filter_by(id=x_subject_id, workspace_id=workspace.id).first() is None:
+            return {"running": False, "current": None, "error": None, "stages": [], "elapsed": 0}
     scope_id = f"{workspace.id}::{x_subject_id}" if x_subject_id else workspace.id
     state = get_runner(scope_id).state
     db = SessionLocal()
     try:
-        job = (db.query(PipelineJob).filter_by(workspace_id=workspace.id)
+        job = (db.query(PipelineJob).filter_by(workspace_id=workspace.id, subject_id=x_subject_id)
                .order_by(PipelineJob.created_at.desc()).first())
         if job:
             state["job_id"] = job.id
             state["job_status"] = job.status
             if job.status == "completed" and job.finished_at:
-                if _pipeline_loaded_at.get(workspace.id, 0.0) < job.finished_at.timestamp():
-                    _invalidate_pipeline(workspace.id)
+                if _pipeline_loaded_at.get(scope_id, 0.0) < job.finished_at.timestamp():
+                    _invalidate_pipeline(scope_id)
     finally:
         db.close()
     return state
 
 
 @app.post("/ask")
-def ask(req: AskRequest, workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
-    pipeline = get_pipeline(workspace.id)
+def ask(req: AskRequest, x_subject_id: str | None = Header(default=None), workspace: Workspace = Depends(current_workspace), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    if x_subject_id:
+        subject_for_workspace(x_subject_id, workspace, db)
+        _materialize_subject_artifacts(workspace, x_subject_id, db)
+    scope_id = f"{workspace.id}::{x_subject_id}" if x_subject_id else workspace.id
+    pipeline = get_pipeline(scope_id)
     try:
         answer = pipeline.ask(req.query, req.top_k).to_dict()
         session = None

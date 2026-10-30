@@ -112,14 +112,20 @@ export function setSubjectId(id: string | null): void {
 
 export function setWorkspaceId(id: string): void {
   if (typeof window === "undefined") return;
+  const previous = window.localStorage.getItem(WORKSPACE_KEY);
+  if (previous && previous !== id) window.localStorage.removeItem(SUBJECT_KEY);
   window.localStorage.setItem(WORKSPACE_KEY, id);
 }
 
 export function saveSession(data: AuthResponse): void {
   if (typeof window === "undefined") return;
   window.localStorage.removeItem(LOGGED_OUT_KEY);
+  // A login can replace a different account in the same browser tab. Never
+  // let that account inherit the previous account's workspace or subject.
+  window.localStorage.removeItem(WORKSPACE_KEY);
+  window.localStorage.removeItem(SUBJECT_KEY);
   window.localStorage.setItem(TOKEN_KEY, data.access_token);
-  if (data.workspace?.id) window.localStorage.setItem(WORKSPACE_KEY, data.workspace.id);
+  if (data.workspace?.id) setWorkspaceId(data.workspace.id);
   if (data.user) window.localStorage.setItem("conceptscape.user", JSON.stringify(data.user));
 }
 
@@ -127,6 +133,7 @@ export function clearSession(): void {
   if (typeof window === "undefined") return;
   window.localStorage.removeItem(TOKEN_KEY);
   window.localStorage.removeItem(WORKSPACE_KEY);
+  window.localStorage.removeItem(SUBJECT_KEY);
   window.localStorage.removeItem("conceptscape.user");
   window.localStorage.setItem(LOGGED_OUT_KEY, "true");
 }

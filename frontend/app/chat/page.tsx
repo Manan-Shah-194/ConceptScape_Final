@@ -13,7 +13,6 @@ import {
   Edit2,
   Sparkles,
   Network,
-  ChevronRight,
   Copy,
   Check,
   ExternalLink,
@@ -62,49 +61,11 @@ type Flashcard = {
   flipped?: boolean;
 };
 
-const PROMPT_CATEGORIES = [
-  {
-    category: "CORE CONCEPT FUNDAMENTALS",
-    prompts: [
-      "What is a learning rate and how does it determine step size?",
-      "Explain the fundamental difference between convex and non-convex loss functions.",
-    ],
-  },
-  {
-    category: "RELATIONAL DEPENDENCIES & FLOW",
-    prompts: [
-      "What does mini-batch SGD require to converge?",
-      "How does momentum interact with the learning rate during gradient descent?",
-    ],
-  },
-  {
-    category: "PROBLEM SOLVING & CONVERGENCE",
-    prompts: [
-      "How do I diagnose and stop my model overshooting the minimum?",
-      "What causes vanishing gradients and how do modern architectures prevent it?",
-    ],
-  },
-];
-
-const QUICK_TOPICS = [
-  "SGD Optimization",
-  "Learning Rates",
-  "Loss Functions",
-  "Gradient Descent",
-  "Convergence Rates",
-  "Regularization",
-];
-
 const COMPOSER_MODIFIERS = [
   { label: "Explain simply", prefix: "Explain in simple terms: " },
   { label: "Prerequisites", prefix: "What are the required prerequisites for: " },
   { label: "Compare with", prefix: "Compare and contrast: " },
   { label: "Evidence & citations", prefix: "What evidence and citations support: " },
-];
-
-const DEFAULT_SESSIONS: ChatSession[] = [
-  { id: "sess-1", title: "Understanding Mini-Batch ...", created_at: new Date().toISOString(), messages: [] },
-  { id: "sess-2", title: "Navigating Non-Convex Lo...", created_at: new Date().toISOString(), messages: [] },
 ];
 
 export default function ChatPage() {
@@ -123,7 +84,7 @@ function ChatWorkspace() {
   const [busy, setBusy] = useState(false);
   const [openCitation, setOpenCitation] = useState<Citation | null>(null);
   const [sessionId, setSessionId] = useState<string | undefined>();
-  const [sessions, setSessions] = useState<ChatSession[]>(DEFAULT_SESSIONS);
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [sessionSearch, setSessionSearch] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
@@ -140,15 +101,7 @@ function ChatWorkspace() {
   }, []);
 
   // Study Flashcards state
-  const [flashcards, setFlashcards] = useState<Flashcard[]>([
-    {
-      id: "fc-init-1",
-      front: "What does Mini-Batch SGD require to guarantee convergence?",
-      back: "A diminishing learning rate schedule satisfying the Robbins-Monro conditions, plus unbiased gradient estimates from random mini-batches.",
-      source: "lecture_optimization.pdf (p.14)",
-      mastered: false,
-    },
-  ]);
+  const [flashcards, setFlashcards] = useState<Flashcard[]>([]);
   const [flashcardExportCopied, setFlashcardExportCopied] = useState(false);
 
   const endRef = useRef<HTMLDivElement>(null);
@@ -190,7 +143,7 @@ function ChatWorkspace() {
   }, [turns, activeTurnIndex]);
 
   const filteredSessions = useMemo(() => {
-    const list = sessions.length > 0 ? sessions : DEFAULT_SESSIONS;
+    const list = sessions;
     if (!sessionSearch.trim()) return list;
     return list.filter((s) => s.title.toLowerCase().includes(sessionSearch.toLowerCase()));
   }, [sessions, sessionSearch]);
@@ -483,7 +436,8 @@ function ChatWorkspace() {
             })}
           </div>
 
-          {/* Quick Study Topics */}
+          {/* Study topics are intentionally sourced from the active indexed corpus.
+              Do not show sample topics when the account has no real chat data. */}
           <div style={{ padding: "14px", borderTop: "2px solid #E8DDD5", background: "#FFFFFF" }}>
             <div
               style={{
@@ -495,37 +449,11 @@ function ChatWorkspace() {
                 marginBottom: 8,
               }}
             >
-              Quick Study Topics
+              Indexed study topics
             </div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-              {QUICK_TOPICS.map((topic) => (
-                <button
-                  key={topic}
-                  onClick={() => submit(`Explain the key concepts and relationships of ${topic}`)}
-                  style={{
-                    padding: "4px 10px",
-                    borderRadius: 9999,
-                    background: "#FAF7F5",
-                    border: "1.5px solid #E8DDD5",
-                    fontSize: 16.5,
-                    fontWeight: 600,
-                    color: "#6E5B4F",
-                    cursor: "pointer",
-                    transition: "all 0.12s ease",
-                  }}
-                  onMouseOver={(e) => {
-                    e.currentTarget.style.borderColor = "#362419";
-                    e.currentTarget.style.color = "#2D1E15";
-                  }}
-                  onMouseOut={(e) => {
-                    e.currentTarget.style.borderColor = "#E8DDD5";
-                    e.currentTarget.style.color = "#6E5B4F";
-                  }}
-                >
-                  #{topic}
-                </button>
-              ))}
-            </div>
+            <p style={{ margin: 0, color: "#6E5B4F", lineHeight: 1.45 }}>
+              Ask a question about the documents indexed in the active workspace. Study topics will appear here only when they are returned by the backend corpus.
+            </p>
           </div>
         </aside>
       )}
@@ -675,82 +603,17 @@ function ChatWorkspace() {
                     </p>
                   </div>
 
-                  {/* 3 Categories of Prompt Cards */}
-                  <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-                    {PROMPT_CATEGORIES.map((cat) => (
-                      <div key={cat.category}>
-                        <div
-                          style={{
-                            fontSize: 16.5,
-                            fontWeight: 800,
-                            textTransform: "uppercase",
-                            letterSpacing: "0.06em",
-                            color: "#6E5B4F",
-                            marginBottom: 10,
-                          }}
-                        >
-                          {cat.category}
-                        </div>
-                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-                          {cat.prompts.map((p) => (
-                            <button
-                              key={p}
-                              onClick={() => submit(p)}
-                              style={{
-                                display: "flex",
-                                alignItems: "center",
-                                justifyContent: "space-between",
-                                gap: 12,
-                                padding: "13px 16px",
-                                background: "#FFFFFF",
-                                border: "2px solid #E8DDD5",
-                                borderRadius: 12,
-                                cursor: "pointer",
-                                textAlign: "left",
-                                transition: "all 0.15s ease",
-                              }}
-                              onMouseOver={(e) => {
-                                e.currentTarget.style.borderColor = "#362419";
-                                e.currentTarget.style.background = "#FAF7F5";
-                              }}
-                              onMouseOut={(e) => {
-                                e.currentTarget.style.borderColor = "#E8DDD5";
-                                e.currentTarget.style.background = "#FFFFFF";
-                              }}
-                            >
-                              <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0, flex: 1 }}>
-                                <div
-                                  style={{
-                                    width: 32,
-                                    height: 32,
-                                    borderRadius: 8,
-                                    background: "#FAF0E6",
-                                    display: "flex",
-                                    alignItems: "center",
-                                    justifyContent: "center",
-                                    color: "#8B5E3C",
-                                    flexShrink: 0,
-                                  }}
-                                >
-                                  <FileText size={16} strokeWidth={2} />
-                                </div>
-                                <span
-                                  style={{
-                                    fontSize: 18.8,
-                                    fontWeight: 600,
-                                    color: "#2D1E15",
-                                    lineHeight: 1.4,
-                                  }}
-                                >
-                                  {p}
-                                </span>
-                              </div>
-                              <ChevronRight size={15} color="#9C897B" style={{ flexShrink: 0 }} />
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    ))}
+                  <div
+                    style={{
+                      border: "1.5px solid #E8DDD5",
+                      borderRadius: 14,
+                      padding: "18px 20px",
+                      background: "#FAF7F5",
+                      color: "#6E5B4F",
+                      textAlign: "center",
+                    }}
+                  >
+                    No sample questions are preloaded. Enter a question below and the answer will be generated only from the active workspace documents.
                   </div>
                 </div>
               )}
